@@ -1,0 +1,29 @@
+name = "viem-proxy-workers"
+main = "src/index.ts"
+compatibility_date = "2024-01-01"
+compatibility_flags = ["nodejs_compat"]
+
+[env.production]
+name = "viem-proxy-workers"
+
+[env.staging]
+name = "viem-proxy-workers-staging"
+
+# Durable Objects configuration
+[[durable_objects.bindings]]
+name = "PROXY_STATE"
+class_name = "ProxyState"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["ProxyState"]
+
+[vars]
+ENVIRONMENT = "production"
+MAX_CACHE_TTL = "31536000"
+DEFAULT_CACHE_TTL = "300"
+COMPRESSION_THRESHOLD = "1500"
+FINALIZED_BLOCK_CACHE_TTL = "2592000"  # 30 days (30*24*3600)
+
+[build]
+command = "npm run build"

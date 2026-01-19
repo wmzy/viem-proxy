@@ -1,0 +1,106 @@
+import { describe, it, expect } from "vitest";
+
+describe("Index exports", () => {
+  it("should export compressParams function", async () => {
+    const exports = await import("../index");
+    expect(exports.compressParams).toBeDefined();
+    expect(typeof exports.compressParams).toBe("function");
+  });
+
+  it("should export decompressParams function", async () => {
+    const exports = await import("../index");
+    expect(exports.decompressParams).toBeDefined();
+    expect(typeof exports.decompressParams).toBe("function");
+  });
+
+  it("should export generateParamHash function", async () => {
+    const exports = await import("../index");
+    expect(exports.generateParamHash).toBeDefined();
+    expect(typeof exports.generateParamHash).toBe("function");
+  });
+
+  it("should export shouldCompress function", async () => {
+    const exports = await import("../index");
+    expect(exports.shouldCompress).toBeDefined();
+    expect(typeof exports.shouldCompress).toBe("function");
+  });
+
+  it("should export shouldUseHashReference function", async () => {
+    const exports = await import("../index");
+    expect(exports.shouldUseHashReference).toBeDefined();
+    expect(typeof exports.shouldUseHashReference).toBe("function");
+  });
+
+  it("should export http transport function from viem", async () => {
+    const exports = await import("../index");
+    expect(exports.http).toBeDefined();
+    expect(typeof exports.http).toBe("function");
+  });
+
+  it("should export createPublicClient function", async () => {
+    const exports = await import("../index");
+    expect(exports.createPublicClient).toBeDefined();
+    expect(typeof exports.createPublicClient).toBe("function");
+  });
+
+  it("should re-export viem exports", async () => {
+    const exports = await import("../index");
+
+    // Check some key viem exports are available
+    expect(exports.createWalletClient).toBeDefined();
+    expect(typeof exports.createWalletClient).toBe("function");
+
+    expect(exports.formatUnits).toBeDefined();
+    expect(typeof exports.formatUnits).toBe("function");
+  });
+
+  it("should allow creating public client with proxy", async () => {
+    const exports = await import("../index");
+
+    const client = exports.createPublicClient({
+      chain: {
+        id: 1,
+        name: "Mainnet",
+        nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 },
+        rpcUrls: { default: { http: ["https://eth.llamarpc.com"] } },
+      },
+      proxy: {
+        enabled: true,
+        endpoint: "https://proxy.example.com",
+      },
+    });
+
+    expect(client).toBeDefined();
+    expect(client.proxy?.endpoint).toBe("https://proxy.example.com");
+  });
+
+  it("should export compression utils", async () => {
+    const exports = await import("../index");
+
+    const testParams = '["0x123", "latest"]';
+    const compressed = exports.compressParams(testParams);
+    expect(compressed.compressed).toBeDefined();
+    expect(compressed.originalSize).toBe(testParams.length);
+
+    const decompressed = exports.decompressParams(compressed.compressed);
+    expect(decompressed).toBe(testParams);
+  });
+
+  it("should test hash generation", async () => {
+    const exports = await import("../index");
+
+    const testParams = '["0x123", "latest"]';
+    const hash1 = await exports.generateParamHash(testParams);
+    const hash2 = await exports.generateParamHash(testParams);
+
+    expect(hash1).toBe(hash2);
+    expect(hash1).toHaveLength(64); // SHA-256 hex
+  });
+
+  it("should import chains correctly", async () => {
+    const viemChains = await import("viem/chains");
+
+    expect(viemChains.mainnet).toBeDefined();
+    expect(viemChains.sepolia).toBeDefined();
+  });
+});
