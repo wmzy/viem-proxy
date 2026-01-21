@@ -6,7 +6,7 @@ export default defineConfig({
   plugins: [
     dts({
       include: ["src/**/*.ts"],
-      exclude: ["src/**/*.test.ts"],
+      exclude: ["src/**/*.test.ts", "src/**/*.server.ts"],
       rollupTypes: true,
     }),
   ],
@@ -15,6 +15,7 @@ export default defineConfig({
       entry: {
         index: resolve(__dirname, "src/index.ts"),
         chains: resolve(__dirname, "src/chains.ts"),
+        actions: resolve(__dirname, "src/actions/index.ts"),
       },
       formats: ["es", "cjs"],
       fileName: (format, entryName) => {
@@ -23,7 +24,7 @@ export default defineConfig({
       },
     },
     rollupOptions: {
-      external: ["viem"],
+      external: ["viem", "viem/actions"],
       output: {
         preserveModules: false,
       },

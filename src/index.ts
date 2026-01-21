@@ -22,6 +22,11 @@ export type {
 
 export { createPublicClient } from "./client";
 
+// Export proxyActions for extend pattern
+export { proxyActions } from "./actions/proxyActions";
+export type { ProxyActionsReturnType } from "./actions/proxyActions";
+export type { ProxyActionConfig } from "./actions/types";
+
 // Export compression utilities
 export {
   compressParams,

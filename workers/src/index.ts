@@ -8,8 +8,8 @@ import {
   handleHashReferenceRequest,
   handleStoreParams,
   handleDirectRequest,
-  handleFunctionRequest,
 } from "./handlers/proxy";
+import { handleActionRequest } from "./handlers/actions";
 
 // Export Durable Object
 export { ProxyState } from "./durable-objects/proxy-state";
@@ -43,8 +43,8 @@ app.get("/", (c) => {
 
 // API routes
 
-// Function-based requests (new)
-app.post("/api/v1/:chainId/:functionName", handleFunctionRequest);
+// Action-based requests (modular actions)
+app.post("/api/v1/:chainId/:actionName", handleActionRequest);
 
 // Compressed parameter requests
 app.get("/api/v1/:chainId/:method", handleCompressedRequest);

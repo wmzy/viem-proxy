@@ -15,6 +15,11 @@
       "types": "./dist/chains.d.ts",
       "import": "./dist/chains.mjs",
       "require": "./dist/chains.js"
+    },
+    "./actions": {
+      "types": "./dist/actions.d.ts",
+      "import": "./dist/actions.mjs",
+      "require": "./dist/actions.js"
     }
   },
   "files": [

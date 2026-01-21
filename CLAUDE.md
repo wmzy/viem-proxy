@@ -72,16 +72,25 @@ The library implements a **Cloudflare Workers-based RPC caching proxy** with top
 ### Key Components
 
 1. **ProxyPublicClient** (`src/client.ts`): Extended viem PublicClient with proxied read methods
-2. **Proxy Actions** (`src/proxy-actions.ts`): Individual proxy implementations for each viem action
+2. **Modular Actions** (`src/actions/`): Individual proxy implementations for each viem action
+   - Client actions (`*.client.ts`): Client-side proxy logic
+   - Server actions (`*.server.ts`): Server-side RPC execution (for reference)
+   - `proxyActions.ts`: Extend helper for `client.extend()` pattern
 3. **Compression Engine** (`src/utils/compression.ts`): Multi-layer compression (function selectors → addresses → zero padding → Base64)
-4. **Workers API** (`workers/src/index.ts`): Hono-based REST API with function-based endpoints
-5. **Durable Objects** (`workers/src/durable-objects/proxy-state.ts`): SQLite-based storage for params and request deduplication
-6. **Cache Strategy** (`workers/src/utils/cache.ts`): Method-specific TTL optimization and block-aware caching
+4. **Workers API** (`workers/src/index.ts`): Hono-based REST API with action-based endpoints
+5. **Workers Actions** (`workers/src/actions/`): Server-side action handlers
+6. **Durable Objects** (`workers/src/durable-objects/proxy-state.ts`): SQLite-based storage for params and request deduplication
+7. **Cache Strategy** (`workers/src/utils/cache.ts`): Method-specific TTL optimization and block-aware caching
 
 ### Request Flow
 ```
-Client → Proxy Action → Workers API → Durable Objects → CDN Cache → RPC Provider
+Client → Proxy Action (*.client.ts) → Workers API → Action Handler (*.server.ts) → Durable Objects → CDN Cache → RPC Provider
 ```
+
+### Usage Patterns
+1. **createPublicClient with proxy config**: Simple drop-in replacement
+2. **client.extend(proxyActions())**: Recommended for tree-shaking
+3. **Standalone action import**: Best tree-shaking, import only what you need
 
 ### Supported Methods (by Priority)
 

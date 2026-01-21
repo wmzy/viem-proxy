@@ -7,19 +7,7 @@ import {
   http as viemHttp,
 } from "viem";
 import type { ProxyPublicClient, ProxyConfig } from "./types";
-import {
-  createProxyGetBalance,
-  createProxyGetBlock,
-  createProxyGetBlockNumber,
-  createProxyGetTransaction,
-  createProxyGetTransactionReceipt,
-  createProxyCall,
-  createProxyReadContract,
-  createProxyEstimateGas,
-  createProxyGetGasPrice,
-  createProxyGetLogs,
-  createProxyGetCode,
-} from "./proxy-actions";
+import { proxyActions } from "./actions/proxyActions";
 
 const DEFAULT_PROXY_CONFIG: ProxyConfig = {
   enabled: true,
@@ -39,6 +27,29 @@ type CreatePublicClientConfig<
 
 /**
  * Create a proxy-enabled public client
+ *
+ * @example
+ * // With proxy enabled
+ * const client = createPublicClient({
+ *   chain: mainnet,
+ *   transport: http(),
+ *   proxy: {
+ *     endpoint: 'https://proxy.example.com',
+ *     fallback: true,
+ *   }
+ * })
+ *
+ * @example
+ * // Using extend pattern (recommended for tree-shaking)
+ * import { createPublicClient, http } from 'viem'
+ * import { proxyActions } from 'viem-proxy/actions'
+ *
+ * const client = createPublicClient({
+ *   chain: mainnet,
+ *   transport: http()
+ * }).extend(proxyActions({
+ *   endpoint: 'https://proxy.example.com'
+ * }))
  */
 export const createPublicClient = <
   TChain extends Chain | undefined = undefined,
@@ -127,20 +138,24 @@ export const createPublicClient = <
     return proxyClient;
   }
 
-  // Override P0 actions (high priority) - use type assertions to avoid complex type issues
-  (proxyClient as any).getBalance = createProxyGetBalance(baseClient, finalProxyConfig);
-  (proxyClient as any).getBlock = createProxyGetBlock(baseClient, finalProxyConfig);
-  (proxyClient as any).getBlockNumber = createProxyGetBlockNumber(baseClient, finalProxyConfig);
-  (proxyClient as any).getTransaction = createProxyGetTransaction(baseClient, finalProxyConfig);
-  (proxyClient as any).getTransactionReceipt = createProxyGetTransactionReceipt(baseClient, finalProxyConfig);
-  (proxyClient as any).readContract = createProxyReadContract(baseClient, finalProxyConfig);
+  // Use extend pattern to add proxy actions
+  // Use type assertion to bypass strict type checking for extend
+  const extendedClient = (baseClient as any).extend(
+    proxyActions({
+      endpoint: finalProxyConfig.endpoint,
+      timeout: finalProxyConfig.timeout,
+      fallback: finalProxyConfig.fallback,
+      debug: finalProxyConfig.debug,
+    })
+  ) as ProxyPublicClient<TTransport, TChain>;
 
-  // Override P1 actions (medium priority)
-  (proxyClient as any).call = createProxyCall(baseClient, finalProxyConfig);
-  (proxyClient as any).estimateGas = createProxyEstimateGas(baseClient, finalProxyConfig);
-  (proxyClient as any).getGasPrice = createProxyGetGasPrice(baseClient, finalProxyConfig);
-  (proxyClient as any).getLogs = createProxyGetLogs(baseClient, finalProxyConfig);
-  (proxyClient as any).getCode = createProxyGetCode(baseClient, finalProxyConfig);
+  // Copy over proxy config and helper methods
+  extendedClient.proxy = finalProxyConfig;
+  extendedClient.getCacheStats = proxyClient.getCacheStats;
+  extendedClient.clearCache = proxyClient.clearCache;
+  extendedClient.preheatCache = proxyClient.preheatCache;
+  extendedClient.getMetrics = proxyClient.getMetrics;
+  extendedClient.clearMetrics = proxyClient.clearMetrics;
 
-  return proxyClient;
+  return extendedClient;
 };

@@ -1,12 +1,15 @@
-import { createPublicClient } from "../src";
-import { mainnet } from "../src/chains";
+import { createPublicClient, http } from "viem";
+import { mainnet } from "viem/chains";
+import { proxyActions } from "../src/actions";
 
-// Basic usage example
+// Basic usage example - using createPublicClient with proxy config
 async function basicExample() {
   console.log("=== Basic Usage Example ===");
 
-  // Create proxy client
-  const client = createPublicClient({
+  // Method 1: Using viem-proxy's createPublicClient with proxy config
+  const { createPublicClient: createProxyClient } = await import("../src");
+
+  const client = createProxyClient({
     chain: mainnet,
     proxy: {
       enabled: true,
@@ -53,7 +56,79 @@ async function basicExample() {
       blockNumber: blockNumber - 1n,
     });
     console.log("Block hash:", block?.hash);
-    console.log("Block timestamp:", block?.timestamp ? new Date(Number(block.timestamp) * 1000) : "N/A");
+    console.log(
+      "Block timestamp:",
+      block?.timestamp ? new Date(Number(block.timestamp) * 1000) : "N/A"
+    );
+  } catch (error) {
+    console.error("Error:", error);
+  }
+}
+
+// Extend pattern example (recommended for tree-shaking)
+async function extendPatternExample() {
+  console.log("\n=== Extend Pattern Example ===");
+
+  // Method 2: Using viem's createPublicClient with extend pattern
+  const client = createPublicClient({
+    chain: mainnet,
+    transport: http("https://eth.llamarpc.com"),
+  }).extend(
+    proxyActions({
+      endpoint: "https://your-workers-domain.workers.dev",
+      fallback: true,
+      debug: true,
+    })
+  );
+
+  try {
+    // Get latest block number
+    console.log("Fetching latest block number...");
+    const blockNumber = await client.getBlockNumber();
+    console.log("Latest block:", blockNumber);
+
+    // Get account balance
+    console.log("\nFetching account balance...");
+    const balance = await client.getBalance({
+      address: "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045",
+    });
+    console.log("Balance:", balance, "wei");
+  } catch (error) {
+    console.error("Error:", error);
+  }
+}
+
+// Standalone action example (best for tree-shaking)
+async function standaloneActionExample() {
+  console.log("\n=== Standalone Action Example ===");
+
+  // Method 3: Import individual actions for best tree-shaking
+  const { getBalance, getBlockNumber } = await import("../src/actions");
+
+  const client = createPublicClient({
+    chain: mainnet,
+    transport: http("https://eth.llamarpc.com"),
+  });
+
+  const proxyConfig = {
+    endpoint: "https://your-workers-domain.workers.dev",
+    fallback: true,
+    debug: true,
+  };
+
+  try {
+    // Get latest block number
+    console.log("Fetching latest block number...");
+    const blockNumber = await getBlockNumber(client, { proxy: proxyConfig });
+    console.log("Latest block:", blockNumber);
+
+    // Get account balance
+    console.log("\nFetching account balance...");
+    const balance = await getBalance(client, {
+      address: "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045",
+      proxy: proxyConfig,
+    });
+    console.log("Balance:", balance, "wei");
   } catch (error) {
     console.error("Error:", error);
   }
@@ -63,18 +138,14 @@ async function basicExample() {
 async function cacheExample() {
   console.log("\n=== Cache Strategy Example ===");
 
-  const client = createPublicClient({
+  const { createPublicClient: createProxyClient } = await import("../src");
+
+  const client = createProxyClient({
     chain: mainnet,
     proxy: {
       enabled: true,
       endpoint: "https://your-workers-domain.workers.dev",
       debug: true,
-      cacheControl: {
-        // Custom cache strategy
-        eth_getBalance: 60, // 1 minute
-        eth_call: 120, // 2 minutes
-        eth_getBlockByNumber: 3600, // 1 hour
-      },
     },
   });
 
@@ -97,40 +168,13 @@ async function cacheExample() {
   );
 }
 
-// Large parameters example
-async function largeParamsExample() {
-  console.log("\n=== Large Parameters Example ===");
-
-  const client = createPublicClient({
-    chain: mainnet,
-    proxy: {
-      enabled: true,
-      endpoint: "https://your-workers-domain.workers.dev",
-      debug: true,
-      compressionThreshold: 500, // Lower threshold for demo
-    },
-  });
-
-  // Simulate contract call with large parameters
-  const largeCalldata = "0x" + "0".repeat(1000); // Large data
-
-  try {
-    console.log("Making call with large parameters...");
-    const result = await client.call({
-      to: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
-      data: largeCalldata as `0x${string}`,
-    });
-    console.log("Call result:", result);
-  } catch (error) {
-    console.log("Expected error for demo calldata:", (error as Error).message);
-  }
-}
-
 // Proxy methods example
 async function proxyMethodsExample() {
   console.log("\n=== Proxy Methods Example ===");
 
-  const client = createPublicClient({
+  const { createPublicClient: createProxyClient } = await import("../src");
+
+  const client = createProxyClient({
     chain: mainnet,
     proxy: {
       enabled: true,
@@ -158,11 +202,18 @@ async function proxyMethodsExample() {
 // Run examples
 async function runExamples() {
   await basicExample();
+  await extendPatternExample();
+  await standaloneActionExample();
   await cacheExample();
-  await largeParamsExample();
   await proxyMethodsExample();
 }
 
 runExamples().catch(console.error);
 
-export { basicExample, cacheExample, largeParamsExample, proxyMethodsExample };
+export {
+  basicExample,
+  extendPatternExample,
+  standaloneActionExample,
+  cacheExample,
+  proxyMethodsExample,
+};
