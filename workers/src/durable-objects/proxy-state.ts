@@ -205,21 +205,10 @@ export class ProxyState extends DurableObject<Env> {
   }
 
   /**
-   * Wait for a pending request to complete
+   * Check request status (non-blocking, caller handles retry)
    */
-  async waitForRequest(requestHash: string, timeoutMs = 30000): Promise<PendingRequest | null> {
-    const startTime = Date.now();
-    const pollInterval = 50; // 50ms
-
-    while (Date.now() - startTime < timeoutMs) {
-      const request = await this.checkPendingRequest(requestHash);
-      if (request && request.status !== "pending") {
-        return request;
-      }
-      await new Promise((resolve) => setTimeout(resolve, pollInterval));
-    }
-
-    return null;
+  async getRequestStatus(requestHash: string): Promise<PendingRequest | null> {
+    return this.checkPendingRequest(requestHash);
   }
 
   /**
@@ -295,18 +284,17 @@ export class ProxyState extends DurableObject<Env> {
         });
       }
 
-      // Wait for request: GET /requests/:hash/wait
-      if (request.method === "GET" && path.includes("/wait")) {
+      // Check request status: GET /requests/:hash/status
+      if (request.method === "GET" && path.includes("/status")) {
         const requestHash = path.split("/")[2];
-        const timeout = parseInt(url.searchParams.get("timeout") || "30000");
-        const result = await this.waitForRequest(requestHash, timeout);
+        const result = await this.getRequestStatus(requestHash);
         if (result) {
           return new Response(JSON.stringify(result), {
             headers: { "Content-Type": "application/json" },
           });
         }
-        return new Response(JSON.stringify({ error: "Timeout" }), {
-          status: 408,
+        return new Response(JSON.stringify({ error: "Not found" }), {
+          status: 404,
           headers: { "Content-Type": "application/json" },
         });
       }

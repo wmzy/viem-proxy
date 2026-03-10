@@ -4,17 +4,25 @@ import { actionHandlers, type ActionName, type ActionContext } from "../actions"
 import { getCacheStrategy, setCacheHeaders } from "../utils/cache";
 import { generateParamHash } from "../utils/compression";
 
-/**
- * Get the Durable Object stub for proxy state
- */
-const getProxyState = (c: Context<{ Bindings: Env }>) => {
-  const id = c.env.PROXY_STATE.idFromName("global");
+const ACTION_TO_RPC_METHOD: Record<string, string> = {
+  getBalance: "eth_getBalance",
+  getBlock: "eth_getBlockByNumber",
+  getBlockNumber: "eth_blockNumber",
+  getTransaction: "eth_getTransactionByHash",
+  getTransactionReceipt: "eth_getTransactionReceipt",
+  readContract: "eth_call",
+  call: "eth_call",
+  estimateGas: "eth_estimateGas",
+  getGasPrice: "eth_gasPrice",
+  getLogs: "eth_getLogs",
+  getCode: "eth_getCode",
+};
+
+const getProxyState = (c: Context<{ Bindings: Env }>, chainId: number) => {
+  const id = c.env.PROXY_STATE.idFromName(`chain-${chainId}`);
   return c.env.PROXY_STATE.get(id);
 };
 
-/**
- * Generate request hash for deduplication
- */
 const generateRequestHash = async (
   chainId: number,
   actionName: string,
@@ -33,10 +41,9 @@ const executeWithDeduplication = async <T>(
   actionName: ActionName,
   args: Record<string, unknown>
 ): Promise<{ result: T; blockNumber?: string }> => {
-  const proxyState = getProxyState(c);
+  const proxyState = getProxyState(c, chainId);
   const requestHash = await generateRequestHash(chainId, actionName, args);
 
-  // Check if request is already pending
   const checkResponse = await proxyState.fetch(
     new Request("http://do/requests", {
       method: "POST",
@@ -49,7 +56,6 @@ const executeWithDeduplication = async <T>(
     created?: boolean;
   }>();
 
-  // If request exists and is completed, return cached result
   if (checkResult.exists && checkResult.request) {
     if (checkResult.request.status === "completed" && checkResult.request.result) {
       return JSON.parse(checkResult.request.result);
@@ -57,29 +63,33 @@ const executeWithDeduplication = async <T>(
     if (checkResult.request.status === "failed" && checkResult.request.error) {
       throw new Error(checkResult.request.error);
     }
-    // If pending, wait for it
     if (checkResult.request.status === "pending") {
-      const waitResponse = await proxyState.fetch(
-        new Request(`http://do/requests/${requestHash}/wait?timeout=30000`)
-      );
-      if (waitResponse.ok) {
-        const waitResult = await waitResponse.json<{
+      const maxWait = 30000;
+      const start = Date.now();
+      let interval = 50;
+      while (Date.now() - start < maxWait) {
+        await new Promise((r) => setTimeout(r, interval));
+        interval = Math.min(interval * 2, 500);
+        const statusRes = await proxyState.fetch(
+          new Request(`http://do/requests/${requestHash}/status`)
+        );
+        if (!statusRes.ok) continue;
+        const status = await statusRes.json<{
           status: string;
           result?: string;
           error?: string;
         }>();
-        if (waitResult.status === "completed" && waitResult.result) {
-          return JSON.parse(waitResult.result);
+        if (status.status === "completed" && status.result) {
+          return JSON.parse(status.result);
         }
-        if (waitResult.status === "failed" && waitResult.error) {
-          throw new Error(waitResult.error);
+        if (status.status === "failed" && status.error) {
+          throw new Error(status.error);
         }
       }
       throw new Error("Request timeout");
     }
   }
 
-  // Execute the action
   try {
     const handler = actionHandlers[actionName];
     const ctx: ActionContext = {
@@ -90,7 +100,6 @@ const executeWithDeduplication = async <T>(
 
     const result = await handler(ctx as any);
 
-    // Mark request as completed
     await proxyState.fetch(
       new Request(`http://do/requests/${requestHash}/complete`, {
         method: "PUT",
@@ -100,7 +109,6 @@ const executeWithDeduplication = async <T>(
 
     return result as { result: T; blockNumber?: string };
   } catch (error) {
-    // Mark request as failed
     await proxyState.fetch(
       new Request(`http://do/requests/${requestHash}/fail`, {
         method: "PUT",
@@ -142,10 +150,10 @@ export const handleActionRequest = async (c: Context<{ Bindings: Env }>) => {
       args
     );
 
-    // Get cache strategy
+    const rpcMethod = ACTION_TO_RPC_METHOD[actionName] ?? actionName;
     const cacheStrategy = getCacheStrategy(
       chainIdNum,
-      actionName,
+      rpcMethod,
       args,
       300,
       result.blockNumber ? parseInt(result.blockNumber, 16) : undefined
@@ -160,12 +168,13 @@ export const handleActionRequest = async (c: Context<{ Bindings: Env }>) => {
     return setCacheHeaders(response, cacheStrategy.ttl);
   } catch (error) {
     console.error("Action request error:", error);
+    const isDebug = c.env.ENVIRONMENT !== "production";
     return c.json(
       {
         error: {
           code: -32603,
           message: "Internal error",
-          data: error instanceof Error ? error.message : "Unknown error",
+          ...(isDebug ? { data: error instanceof Error ? error.message : "Unknown error" } : {}),
         },
       },
       500

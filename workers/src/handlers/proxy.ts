@@ -14,18 +14,13 @@ import {
   getCacheStrategy,
   setCacheHeaders,
 } from "../utils/cache";
+import { getRpcUrls, executeRpcCall as sharedExecuteRpcCall } from "../actions/utils";
 
-/**
- * Get the Durable Object stub for proxy state
- */
-const getProxyState = (c: Context<{ Bindings: Env }>) => {
-  const id = c.env.PROXY_STATE.idFromName("global");
+const getProxyState = (c: Context<{ Bindings: Env }>, chainId: number) => {
+  const id = c.env.PROXY_STATE.idFromName(`chain-${chainId}`);
   return c.env.PROXY_STATE.get(id);
 };
 
-/**
- * Generate request hash for deduplication
- */
 const generateRequestHash = async (
   chainId: number,
   method: string,
@@ -42,7 +37,7 @@ const executeWithDeduplication = async (
   c: Context<{ Bindings: Env }>,
   requestInfo: RequestInfo
 ): Promise<{ result: unknown; blockNumber?: string }> => {
-  const proxyState = getProxyState(c);
+  const proxyState = getProxyState(c, requestInfo.chainId);
   const requestHash = await generateRequestHash(
     requestInfo.chainId,
     requestInfo.method,
@@ -70,22 +65,27 @@ const executeWithDeduplication = async (
     if (checkResult.request.status === "failed" && checkResult.request.error) {
       throw new Error(checkResult.request.error);
     }
-    // If pending, wait for it
     if (checkResult.request.status === "pending") {
-      const waitResponse = await proxyState.fetch(
-        new Request(`http://do/requests/${requestHash}/wait?timeout=30000`)
-      );
-      if (waitResponse.ok) {
-        const waitResult = await waitResponse.json<{
+      const maxWait = 30000;
+      const start = Date.now();
+      let interval = 50;
+      while (Date.now() - start < maxWait) {
+        await new Promise((r) => setTimeout(r, interval));
+        interval = Math.min(interval * 2, 500);
+        const statusRes = await proxyState.fetch(
+          new Request(`http://do/requests/${requestHash}/status`)
+        );
+        if (!statusRes.ok) continue;
+        const status = await statusRes.json<{
           status: string;
           result?: string;
           error?: string;
         }>();
-        if (waitResult.status === "completed" && waitResult.result) {
-          return JSON.parse(waitResult.result);
+        if (status.status === "completed" && status.result) {
+          return JSON.parse(status.result);
         }
-        if (waitResult.status === "failed" && waitResult.error) {
-          throw new Error(waitResult.error);
+        if (status.status === "failed" && status.error) {
+          throw new Error(status.error);
         }
       }
       throw new Error("Request timeout");
@@ -169,12 +169,13 @@ export const handleCompressedRequest = async (
     return setCacheHeaders(response, cacheStrategy.ttl);
   } catch (error) {
     console.error("Compressed request error:", error);
+    const isDebug = c.env.ENVIRONMENT !== "production";
     return c.json(
       {
         error: {
           code: -32603,
           message: "Internal error",
-          data: error instanceof Error ? error.message : "Unknown error",
+          ...(isDebug ? { data: error instanceof Error ? error.message : "Unknown error" } : {}),
         },
       },
       500
@@ -200,7 +201,7 @@ export const handleHashReferenceRequest = async (
     }
 
     const chainId = parseInt(chainIdStr);
-    const proxyState = getProxyState(c);
+    const proxyState = getProxyState(c, chainId);
 
     // Try to get params from DO
     const paramsResponse = await proxyState.fetch(
@@ -273,12 +274,13 @@ export const handleHashReferenceRequest = async (
     return setCacheHeaders(response, cacheStrategy.ttl);
   } catch (error) {
     console.error("Hash reference request error:", error);
+    const isDebug = c.env.ENVIRONMENT !== "production";
     return c.json(
       {
         error: {
           code: -32603,
           message: "Internal error",
-          data: error instanceof Error ? error.message : "Unknown error",
+          ...(isDebug ? { data: error instanceof Error ? error.message : "Unknown error" } : {}),
         },
       },
       500
@@ -306,8 +308,8 @@ export const handleStoreParams = async (c: Context<{ Bindings: Env }>) => {
       return c.json({ error: { code: -32602, message: "Hash mismatch" } }, 400);
     }
 
-    // Store params in DO
-    const proxyState = getProxyState(c);
+    const id = c.env.PROXY_STATE.idFromName("params-store");
+    const proxyState = c.env.PROXY_STATE.get(id);
     await proxyState.fetch(
       new Request("http://do/params", {
         method: "POST",
@@ -318,12 +320,13 @@ export const handleStoreParams = async (c: Context<{ Bindings: Env }>) => {
     return c.json({ success: true });
   } catch (error) {
     console.error("Store params error:", error);
+    const isDebug = c.env.ENVIRONMENT !== "production";
     return c.json(
       {
         error: {
           code: -32603,
           message: "Internal error",
-          data: error instanceof Error ? error.message : "Unknown error",
+          ...(isDebug ? { data: error instanceof Error ? error.message : "Unknown error" } : {}),
         },
       },
       500
@@ -356,12 +359,13 @@ export const handleDirectRequest = async (c: Context<{ Bindings: Env }>) => {
     });
   } catch (error) {
     console.error("Direct request error:", error);
+    const isDebug = c.env.ENVIRONMENT !== "production";
     return c.json(
       {
         error: {
           code: -32603,
           message: "Internal error",
-          data: error instanceof Error ? error.message : "Unknown error",
+          ...(isDebug ? { data: error instanceof Error ? error.message : "Unknown error" } : {}),
         },
       },
       500
@@ -405,12 +409,13 @@ export const handleFunctionRequest = async (c: Context<{ Bindings: Env }>) => {
     return setCacheHeaders(response, cacheStrategy.ttl);
   } catch (error) {
     console.error("Function request error:", error);
+    const isDebug = c.env.ENVIRONMENT !== "production";
     return c.json(
       {
         error: {
           code: -32603,
           message: "Internal error",
-          data: error instanceof Error ? error.message : "Unknown error",
+          ...(isDebug ? { data: error instanceof Error ? error.message : "Unknown error" } : {}),
         },
       },
       500
@@ -553,124 +558,9 @@ const convertFunctionToRpc = (
   }
 };
 
-/**
- * Execute single RPC call
- */
-const executeSingleRpcCall = async (
-  requestInfo: RequestInfo,
-  rpcUrl: string
-): Promise<{ result: unknown; blockNumber?: string }> => {
-  const rpcRequest: RpcRequest = {
-    jsonrpc: "2.0",
-    id: Date.now(),
-    method: requestInfo.method,
-    params: requestInfo.params,
-  };
-
-  const response = await fetch(rpcUrl, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "User-Agent": "viem-proxy/1.0",
-    },
-    body: JSON.stringify(rpcRequest),
-  });
-
-  if (!response.ok) {
-    throw new Error(
-      `RPC request failed: ${response.status} ${response.statusText}`
-    );
-  }
-
-  const rpcResponse: RpcResponse = await response.json();
-
-  if (rpcResponse.error) {
-    throw new Error(`RPC error: ${rpcResponse.error.message}`);
-  }
-
-  // Try to get related block number
-  let blockNumber: string | undefined;
-
-  if (requestInfo.method === "eth_blockNumber") {
-    blockNumber = rpcResponse.result as string;
-  } else if (
-    requestInfo.method.includes("Block") &&
-    typeof rpcResponse.result === "object" &&
-    rpcResponse.result !== null &&
-    "number" in rpcResponse.result
-  ) {
-    blockNumber = (rpcResponse.result as { number: string }).number;
-  }
-
-  return {
-    result: rpcResponse.result,
-    blockNumber,
-  };
-};
-
-/**
- * Get RPC URLs for chain
- */
-const getRpcUrls = (chainId: number): string[] => {
-  switch (chainId) {
-    case 1: // Ethereum Mainnet
-      return [
-        "https://eth.llamarpc.com",
-        "https://rpc.ankr.com/eth",
-        "https://ethereum.publicnode.com",
-      ];
-    case 137: // Polygon
-      return [
-        "https://polygon.llamarpc.com",
-        "https://rpc.ankr.com/polygon",
-        "https://polygon-rpc.com",
-      ];
-    case 42161: // Arbitrum One
-      return [
-        "https://arb1.arbitrum.io/rpc",
-        "https://rpc.ankr.com/arbitrum",
-        "https://arbitrum.publicnode.com",
-      ];
-    case 10: // Optimism
-      return [
-        "https://mainnet.optimism.io",
-        "https://rpc.ankr.com/optimism",
-        "https://optimism.publicnode.com",
-      ];
-    case 56: // BSC
-      return [
-        "https://bsc-dataseed.binance.org",
-        "https://rpc.ankr.com/bsc",
-        "https://bsc.publicnode.com",
-      ];
-    default:
-      throw new Error(`Unsupported chain ID: ${chainId}`);
-  }
-};
-
-/**
- * Execute RPC call with load balancing
- */
 const executeRpcCall = async (
   requestInfo: RequestInfo,
   _env: Env
 ): Promise<{ result: unknown; blockNumber?: string }> => {
-  const rpcUrls = getRpcUrls(requestInfo.chainId);
-
-  for (let i = 0; i < rpcUrls.length; i++) {
-    const rpcUrl = rpcUrls[i];
-
-    try {
-      return await executeSingleRpcCall(requestInfo, rpcUrl);
-    } catch (error) {
-      console.error(`[RPC] Failed to call ${rpcUrl}:`, error);
-      if (i === rpcUrls.length - 1) {
-        throw new Error(
-          `All RPC endpoints failed for chain ${requestInfo.chainId}`
-        );
-      }
-    }
-  }
-
-  throw new Error(`No working RPC endpoint for chain ${requestInfo.chainId}`);
+  return sharedExecuteRpcCall(requestInfo.chainId, requestInfo.method, requestInfo.params);
 };

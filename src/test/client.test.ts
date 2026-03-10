@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach } from "vitest";
 import type { Chain } from "viem";
 import { createPublicClient } from "../client";
 
@@ -16,9 +16,9 @@ describe("Client", () => {
 
       expect(client).toBeDefined();
       expect(client.proxy).toBeDefined();
-      expect(client.proxy?.enabled).toBe(true);
-      expect(client.proxy?.fallback).toBe(true);
-      expect(client.proxy?.timeout).toBe(30000);
+      expect(client.proxy.enabled).toBe(true);
+      expect(client.proxy.fallback).toBe(true);
+      expect(client.proxy.timeout).toBe(30000);
     });
 
     it("should create client with custom proxy config", () => {
@@ -38,11 +38,11 @@ describe("Client", () => {
         },
       });
 
-      expect(client.proxy?.enabled).toBe(true);
-      expect(client.proxy?.endpoint).toBe("https://proxy.example.com");
-      expect(client.proxy?.debug).toBe(true);
-      expect(client.proxy?.fallback).toBe(false);
-      expect(client.proxy?.timeout).toBe(60000);
+      expect(client.proxy.enabled).toBe(true);
+      expect(client.proxy.endpoint).toBe("https://proxy.example.com");
+      expect(client.proxy.debug).toBe(true);
+      expect(client.proxy.fallback).toBe(false);
+      expect(client.proxy.timeout).toBe(60000);
     });
 
     it("should preserve chain configuration", () => {
@@ -118,9 +118,8 @@ describe("Client", () => {
     });
 
     it("should implement getCacheStats", async () => {
-      const stats = await client.getCacheStats?.();
+      const stats = await client.getCacheStats();
 
-      expect(stats).toBeDefined();
       expect(stats).toEqual({
         hitRate: 0,
         totalRequests: 0,
@@ -130,19 +129,18 @@ describe("Client", () => {
     });
 
     it("should implement clearCache", async () => {
-      await expect(client.clearCache?.()).resolves.toBeUndefined();
+      await expect(client.clearCache()).resolves.toBeUndefined();
     });
 
     it("should implement getMetrics", async () => {
-      const metrics = await client.getMetrics?.();
+      const metrics = await client.getMetrics();
 
-      expect(metrics).toBeDefined();
-      expect(metrics?.totalRequests).toBe(0);
-      expect(metrics?.cacheHitRate).toBe(0);
+      expect(metrics.totalRequests).toBe(0);
+      expect(metrics.cacheHitRate).toBe(0);
     });
 
     it("should implement clearMetrics", async () => {
-      const result = await client.clearMetrics?.();
+      const result = await client.clearMetrics();
       expect(result).toBe(true);
     });
 
@@ -156,7 +154,7 @@ describe("Client", () => {
         },
       ];
 
-      const result = await client.preheatCache?.(requests);
+      const result = await client.preheatCache(requests);
 
       expect(result).toBeInstanceOf(Array);
       expect(result).toHaveLength(1);
@@ -175,7 +173,7 @@ describe("Client", () => {
       });
 
       expect(client.proxy).toBeDefined();
-      expect(client.proxy?.enabled).toBe(true);
+      expect(client.proxy.enabled).toBe(true);
     });
 
     it("should merge partial proxy config with defaults", () => {
@@ -191,9 +189,9 @@ describe("Client", () => {
         },
       });
 
-      expect(client.proxy?.endpoint).toBe("https://custom.proxy.com");
-      expect(client.proxy?.timeout).toBe(30000);
-      expect(client.proxy?.fallback).toBe(true);
+      expect(client.proxy.endpoint).toBe("https://custom.proxy.com");
+      expect(client.proxy.timeout).toBe(30000);
+      expect(client.proxy.fallback).toBe(true);
     });
 
     it("should handle different chain types", () => {

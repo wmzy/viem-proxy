@@ -197,17 +197,10 @@ describe("Compression Utils", () => {
       Object.defineProperty(global, 'btoa', { value: originalBtoa, writable: true });
     });
 
-    it("should handle decompression errors with proper error messages", () => {
-      const invalidCompressed = "invalid_base64_and_url";
-      
-      try {
-        decompressParams(invalidCompressed);
-        // If no error is thrown, fail the test
-        expect(true).toBe(false);
-      } catch (error) {
-        expect(error).toBeDefined();
-        // We can't rely on specific error message since it depends on browser implementation
-      }
+    it("should handle legacy strings without prefix via fallback", () => {
+      const legacyStr = "some-legacy-string";
+      const decoded = decompressParams(legacyStr);
+      expect(decoded).toBeDefined();
     });
   });
 

@@ -6,7 +6,7 @@ import {
   createPublicClient as createViemPublicClient,
   http as viemHttp,
 } from "viem";
-import type { ProxyPublicClient, ProxyConfig } from "./types";
+import type { ProxyPublicClient, ProxyConfig, RpcRequest, RpcResponse, PerformanceMetrics } from "./types";
 import { proxyActions } from "./actions/proxyActions";
 
 const DEFAULT_PROXY_CONFIG: ProxyConfig = {
@@ -29,10 +29,8 @@ type CreatePublicClientConfig<
  * Create a proxy-enabled public client
  *
  * @example
- * // With proxy enabled
  * const client = createPublicClient({
  *   chain: mainnet,
- *   transport: http(),
  *   proxy: {
  *     endpoint: 'https://proxy.example.com',
  *     fallback: true,
@@ -59,60 +57,75 @@ export const createPublicClient = <
 ): ProxyPublicClient<TTransport, TChain> => {
   const { proxy: proxyConfig, ...clientConfig } = config;
 
-  // Merge proxy config with defaults
   const finalProxyConfig: ProxyConfig = {
     ...DEFAULT_PROXY_CONFIG,
     ...proxyConfig,
   };
 
-  // Create base viem client
-  // If no transport provided, use default http transport
   const transport = clientConfig.transport ?? viemHttp();
   const baseClient = createViemPublicClient({
     ...clientConfig,
     transport,
-  }) as PublicClient;
+  } as PublicClientConfig) as PublicClient;
 
-  // Create proxy client by extending base client
-  const proxyClient = baseClient as ProxyPublicClient<TTransport, TChain>;
+  const helperMethods = {
+    proxy: finalProxyConfig,
 
-  // Store proxy config
-  proxyClient.proxy = finalProxyConfig;
-
-  // Add helper methods regardless of proxy state
-  proxyClient.getCacheStats = async () => {
-    return {
+    getCacheStats: async () => ({
       hitRate: 0,
       totalRequests: 0,
       cacheHits: 0,
       cacheMisses: 0,
-    };
-  };
+    }),
 
-  proxyClient.clearCache = async () => {
-    if (proxyClient.proxy?.debug) {
-      console.log("[viem-proxy] Cache cleared");
-    }
-  };
+    clearCache: async () => {
+      if (finalProxyConfig.debug) {
+        console.log("[viem-proxy] Cache cleared");
+      }
+    },
 
-  proxyClient.preheatCache = async (requests) => {
-    if (proxyClient.proxy?.debug) {
-      console.log(
-        "[viem-proxy] Preheating cache for",
-        requests.length,
-        "requests"
-      );
-    }
-    return requests.map((req) => ({
-      jsonrpc: "2.0" as const,
-      id: req.id,
-      result: null,
-      error: null,
-    }));
-  };
+    preheatCache: async (requests: RpcRequest[]): Promise<RpcResponse[]> => {
+      if (!finalProxyConfig.endpoint) {
+        return requests.map((req) => ({
+          jsonrpc: "2.0" as const,
+          id: req.id,
+          result: null,
+          error: null,
+        }));
+      }
 
-  proxyClient.getMetrics = async () => {
-    return {
+      const headers: Record<string, string> = { "Content-Type": "application/json" };
+      if (finalProxyConfig.apiKey) {
+        headers["X-API-Key"] = finalProxyConfig.apiKey;
+      }
+
+      try {
+        const results = await Promise.allSettled(
+          requests.map((req) =>
+            fetch(`${finalProxyConfig.endpoint}/api/v1/direct/${baseClient.chain?.id ?? 1}/${req.method}`, {
+              method: "POST",
+              headers,
+              body: JSON.stringify(req),
+            }).then((r) => r.json() as Promise<RpcResponse>)
+          )
+        );
+
+        return results.map((r, i) =>
+          r.status === "fulfilled"
+            ? r.value
+            : { jsonrpc: "2.0" as const, id: requests[i].id, result: null, error: null }
+        );
+      } catch {
+        return requests.map((req) => ({
+          jsonrpc: "2.0" as const,
+          id: req.id,
+          result: null,
+          error: null,
+        }));
+      }
+    },
+
+    getMetrics: async (): Promise<PerformanceMetrics> => ({
       totalRequests: 0,
       cacheHitRate: 0,
       averageResponseTime: 0,
@@ -123,39 +136,29 @@ export const createPublicClient = <
         direct: 0,
       },
       methodStats: {},
-    };
+    }),
+
+    clearMetrics: async () => {
+      if (finalProxyConfig.debug) {
+        console.log("[viem-proxy] Metrics cleared");
+      }
+      return true;
+    },
   };
 
-  proxyClient.clearMetrics = async () => {
-    if (proxyClient.proxy?.debug) {
-      console.log("[viem-proxy] Metrics cleared");
-    }
-    return true;
-  };
-
-  // If proxy is disabled or no endpoint, return client without proxied actions
   if (!finalProxyConfig.enabled || !finalProxyConfig.endpoint) {
-    return proxyClient;
+    return Object.assign(baseClient, helperMethods) as ProxyPublicClient<TTransport, TChain>;
   }
 
-  // Use extend pattern to add proxy actions
-  // Use type assertion to bypass strict type checking for extend
   const extendedClient = (baseClient as any).extend(
     proxyActions({
       endpoint: finalProxyConfig.endpoint,
       timeout: finalProxyConfig.timeout,
       fallback: finalProxyConfig.fallback,
       debug: finalProxyConfig.debug,
+      apiKey: finalProxyConfig.apiKey,
     })
-  ) as ProxyPublicClient<TTransport, TChain>;
+  );
 
-  // Copy over proxy config and helper methods
-  extendedClient.proxy = finalProxyConfig;
-  extendedClient.getCacheStats = proxyClient.getCacheStats;
-  extendedClient.clearCache = proxyClient.clearCache;
-  extendedClient.preheatCache = proxyClient.preheatCache;
-  extendedClient.getMetrics = proxyClient.getMetrics;
-  extendedClient.clearMetrics = proxyClient.clearMetrics;
-
-  return extendedClient;
+  return Object.assign(extendedClient, helperMethods) as ProxyPublicClient<TTransport, TChain>;
 };

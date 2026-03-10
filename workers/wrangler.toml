@@ -24,6 +24,8 @@ MAX_CACHE_TTL = "31536000"
 DEFAULT_CACHE_TTL = "300"
 COMPRESSION_THRESHOLD = "1500"
 FINALIZED_BLOCK_CACHE_TTL = "2592000"  # 30 days (30*24*3600)
+# API_KEY = ""  # Set via `wrangler secret put API_KEY` for authentication
+# RPC_URLS = '{"1":["https://eth.llamarpc.com"]}'  # JSON map of chainId -> URL[]
 
 [build]
 command = "npm run build"

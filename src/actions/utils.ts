@@ -3,41 +3,53 @@ import type {
   ProxyResponse,
   ProxyErrorResponse,
 } from "./types";
+import { compressParams } from "../utils/compression";
 
-/**
- * Default proxy configuration
- */
 export const DEFAULT_PROXY_CONFIG: Required<ProxyActionConfig> = {
   endpoint: "",
   timeout: 30000,
   fallback: true,
   debug: false,
+  apiKey: "",
 };
 
-/**
- * Make a proxy request to the server
- */
 export const makeProxyRequest = async <T>(
   functionName: string,
   chainId: number,
   args: Record<string, unknown>,
   config: ProxyActionConfig
 ): Promise<T> => {
-  const { endpoint, timeout = 30000, debug = false } = config;
-  const url = `${endpoint}/api/v1/${chainId}/${functionName}`;
+  const { endpoint, timeout = 30000, debug = false, apiKey } = config;
 
   if (debug) {
     console.log(`[viem-proxy] ${functionName}:`, args);
   }
 
-  const response = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(args),
-    signal: AbortSignal.timeout(timeout),
-  });
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+  };
+  if (apiKey) {
+    headers["X-API-Key"] = apiKey;
+  }
+
+  const argsJson = JSON.stringify(args);
+  const compressed = compressParams(argsJson);
+  const getUrl = `${endpoint}/api/v1/${chainId}/${functionName}?p=${compressed.compressed}`;
+
+  const useGet = getUrl.length <= 2048;
+
+  const response = useGet
+    ? await fetch(getUrl, {
+        method: "GET",
+        headers: apiKey ? { "X-API-Key": apiKey } : undefined,
+        signal: AbortSignal.timeout(timeout),
+      })
+    : await fetch(`${endpoint}/api/v1/${chainId}/${functionName}`, {
+        method: "POST",
+        headers,
+        body: argsJson,
+        signal: AbortSignal.timeout(timeout),
+      });
 
   const data = (await response.json()) as
     | ProxyResponse<T>
@@ -54,9 +66,6 @@ export const makeProxyRequest = async <T>(
   return data.result;
 };
 
-/**
- * Merge proxy config with defaults
- */
 export const mergeProxyConfig = (
   config?: Partial<ProxyActionConfig>
 ): ProxyActionConfig => ({
@@ -64,9 +73,6 @@ export const mergeProxyConfig = (
   ...config,
 });
 
-/**
- * Check if proxy is enabled
- */
 export const isProxyEnabled = (config?: ProxyActionConfig): boolean => {
   return !!config?.endpoint;
 };

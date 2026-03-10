@@ -13,9 +13,11 @@ export type ProxyConfig = {
   fallback?: boolean;
   /** Debug mode */
   debug?: boolean;
+  /** API key for authentication */
+  apiKey?: string;
   /** Custom cache strategy */
   cacheControl?: {
-    [method: string]: number; // Cache time in seconds per method
+    [method: string]: number;
   };
   /** Retry options */
   retryOptions?: {
@@ -77,37 +79,28 @@ export type RpcResponse<T = unknown> = {
   error?: ProxyError | null;
 };
 
-// Extended viem PublicClient type
 export type ProxyPublicClient<
   TTransport extends Transport = Transport,
   TChain extends Chain | undefined = Chain | undefined
 > = PublicClient<TTransport, TChain> & {
-  /** Proxy config */
-  proxy?: ProxyConfig;
-  /** Get cache stats */
-  getCacheStats?: () => Promise<{
+  proxy: ProxyConfig;
+  getCacheStats: () => Promise<{
     hitRate: number;
     totalRequests: number;
     cacheHits: number;
     cacheMisses: number;
   }>;
-  /** Clear cache */
-  clearCache?: () => Promise<void>;
-  /** Preheat cache */
-  preheatCache?: (requests: RpcRequest[]) => Promise<RpcResponse[]>;
-  /** Get metrics */
-  getMetrics?: () => Promise<PerformanceMetrics>;
-  /** Clear metrics */
-  clearMetrics?: () => Promise<boolean>;
+  clearCache: () => Promise<void>;
+  preheatCache: (requests: RpcRequest[]) => Promise<RpcResponse[]>;
+  getMetrics: () => Promise<PerformanceMetrics>;
+  clearMetrics: () => Promise<boolean>;
 };
 
-// Middleware type
 export type ProxyMiddleware = (
   request: RpcRequest,
   next: (request: RpcRequest) => Promise<RpcResponse>
 ) => Promise<RpcResponse>;
 
-// Compression result type
 export type CompressionResult = {
   compressed: string;
   originalSize: number;
@@ -115,14 +108,12 @@ export type CompressionResult = {
   ratio: number;
 };
 
-// Hash storage type
 export type HashStorage = {
   get: (hash: string) => Promise<string | null>;
   set: (hash: string, data: string, ttl?: number) => Promise<void>;
   delete: (hash: string) => Promise<void>;
 };
 
-// Metrics data type
 export type MetricsData = {
   timestamp: number;
   method: string;

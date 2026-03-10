@@ -10,26 +10,48 @@ import {
   handleDirectRequest,
 } from "./handlers/proxy";
 import { handleActionRequest } from "./handlers/actions";
+import { setCustomRpcUrls } from "./actions/utils";
 
-// Export Durable Object
 export { ProxyState } from "./durable-objects/proxy-state";
 
 const app = new Hono<{ Bindings: Env }>();
 
-// Middleware
 app.use(
   "*",
   cors({
     origin: "*",
     allowMethods: ["GET", "POST", "OPTIONS"],
-    allowHeaders: ["Content-Type", "X-Param-Hash", "X-Original-Params"],
+    allowHeaders: ["Content-Type", "X-Param-Hash", "X-Original-Params", "X-API-Key"],
   })
 );
 
 app.use("*", logger());
 app.use("*", prettyJSON());
 
-// Health check
+app.use("/api/*", async (c, next) => {
+  const rpcUrlsJson = c.env.RPC_URLS;
+  if (rpcUrlsJson) {
+    try {
+      setCustomRpcUrls(JSON.parse(rpcUrlsJson));
+    } catch {
+      // ignore parse errors, use defaults
+    }
+  }
+
+  const apiKey = c.env.API_KEY;
+  if (apiKey) {
+    const provided = c.req.header("X-API-Key") ?? c.req.query("key");
+    if (provided !== apiKey) {
+      return c.json(
+        { error: { code: -32600, message: "Unauthorized" } },
+        401
+      );
+    }
+  }
+
+  await next();
+});
+
 app.get("/", (c) => {
   return c.json({
     name: "viem-proxy-workers",
@@ -41,12 +63,10 @@ app.get("/", (c) => {
   });
 });
 
-// API routes
-
 // Action-based requests (modular actions)
 app.post("/api/v1/:chainId/:actionName", handleActionRequest);
 
-// Compressed parameter requests
+// Compressed parameter requests (GET for CDN caching)
 app.get("/api/v1/:chainId/:method", handleCompressedRequest);
 
 // Hash reference requests
@@ -69,22 +89,21 @@ app.get("/api/v1/stats", async (c) => {
   });
 });
 
-// Error handling
 app.onError((err, c) => {
   console.error("Unhandled error:", err);
+  const isDebug = c.env.ENVIRONMENT !== "production";
   return c.json(
     {
       error: {
         code: -32603,
         message: "Internal server error",
-        data: err.message,
+        ...(isDebug ? { data: err.message } : {}),
       },
     },
     500
   );
 });
 
-// 404 handling
 app.notFound((c) => {
   return c.json(
     {

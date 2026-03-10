@@ -1,48 +1,49 @@
 import type { RpcRequest, RpcResponse } from "./types";
 
-/**
- * Get RPC URLs for chain
- */
-export const getRpcUrls = (chainId: number): string[] => {
-  switch (chainId) {
-    case 1: // Ethereum Mainnet
-      return [
-        "https://eth.llamarpc.com",
-        "https://rpc.ankr.com/eth",
-        "https://ethereum.publicnode.com",
-      ];
-    case 137: // Polygon
-      return [
-        "https://polygon.llamarpc.com",
-        "https://rpc.ankr.com/polygon",
-        "https://polygon-rpc.com",
-      ];
-    case 42161: // Arbitrum One
-      return [
-        "https://arb1.arbitrum.io/rpc",
-        "https://rpc.ankr.com/arbitrum",
-        "https://arbitrum.publicnode.com",
-      ];
-    case 10: // Optimism
-      return [
-        "https://mainnet.optimism.io",
-        "https://rpc.ankr.com/optimism",
-        "https://optimism.publicnode.com",
-      ];
-    case 56: // BSC
-      return [
-        "https://bsc-dataseed.binance.org",
-        "https://rpc.ankr.com/bsc",
-        "https://bsc.publicnode.com",
-      ];
-    default:
-      throw new Error(`Unsupported chain ID: ${chainId}`);
-  }
+const DEFAULT_RPC_URLS: Record<number, string[]> = {
+  1: [
+    "https://eth.llamarpc.com",
+    "https://rpc.ankr.com/eth",
+    "https://ethereum.publicnode.com",
+  ],
+  137: [
+    "https://polygon.llamarpc.com",
+    "https://rpc.ankr.com/polygon",
+    "https://polygon-rpc.com",
+  ],
+  42161: [
+    "https://arb1.arbitrum.io/rpc",
+    "https://rpc.ankr.com/arbitrum",
+    "https://arbitrum.publicnode.com",
+  ],
+  10: [
+    "https://mainnet.optimism.io",
+    "https://rpc.ankr.com/optimism",
+    "https://optimism.publicnode.com",
+  ],
+  56: [
+    "https://bsc-dataseed.binance.org",
+    "https://rpc.ankr.com/bsc",
+    "https://bsc.publicnode.com",
+  ],
 };
 
-/**
- * Execute single RPC call
- */
+let customRpcUrls: Record<number, string[]> = {};
+
+export const setCustomRpcUrls = (urls: Record<number, string[]>): void => {
+  customRpcUrls = urls;
+};
+
+export const getRpcUrls = (chainId: number): string[] => {
+  const urls = customRpcUrls[chainId] ?? DEFAULT_RPC_URLS[chainId];
+  if (!urls || urls.length === 0) {
+    throw new Error(`Unsupported chain ID: ${chainId}`);
+  }
+  return urls;
+};
+
+let rpcIdCounter = 0;
+
 export const executeRpcCall = async (
   chainId: number,
   method: string,
@@ -56,7 +57,7 @@ export const executeRpcCall = async (
     try {
       const rpcRequest: RpcRequest = {
         jsonrpc: "2.0",
-        id: Date.now(),
+        id: ++rpcIdCounter,
         method,
         params,
       };
@@ -82,7 +83,6 @@ export const executeRpcCall = async (
         throw new Error(`RPC error: ${rpcResponse.error.message}`);
       }
 
-      // Try to get related block number
       let blockNumber: string | undefined;
 
       if (method === "eth_blockNumber") {

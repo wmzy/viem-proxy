@@ -246,3 +246,165 @@ describe("Mock Environment", () => {
     expect(data.created).toBe(true);
   });
 });
+
+describe("Action Handlers", () => {
+  it("should execute getBalance handler", async () => {
+    const { getBalanceHandler } = await import("../src/actions/getBalance.server");
+
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.resolve({
+        jsonrpc: "2.0",
+        id: 1,
+        result: "0xde0b6b3a7640000",
+      }),
+    });
+
+    const result = await getBalanceHandler({
+      chainId: 1,
+      args: { address: "0x742d35Cc6634C0532925a3b844Bc9e7595f2bD18" },
+      env: mockEnv as any,
+    });
+
+    expect(result.result).toBe("0xde0b6b3a7640000");
+  });
+
+  it("should execute getBlockNumber handler", async () => {
+    const { getBlockNumberHandler } = await import("../src/actions/getBlockNumber.server");
+
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.resolve({
+        jsonrpc: "2.0",
+        id: 1,
+        result: "0x10d4f1",
+      }),
+    });
+
+    const result = await getBlockNumberHandler({
+      chainId: 1,
+      args: {},
+      env: mockEnv as any,
+    });
+
+    expect(result.result).toBe("0x10d4f1");
+    expect(result.blockNumber).toBe("0x10d4f1");
+  });
+
+  it("should execute getGasPrice handler", async () => {
+    const { getGasPriceHandler } = await import("../src/actions/getGasPrice.server");
+
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.resolve({
+        jsonrpc: "2.0",
+        id: 1,
+        result: "0x3b9aca00",
+      }),
+    });
+
+    const result = await getGasPriceHandler({
+      chainId: 1,
+      args: {},
+      env: mockEnv as any,
+    });
+
+    expect(result.result).toBe("0x3b9aca00");
+  });
+
+  it("should execute readContract handler", async () => {
+    const { readContractHandler } = await import("../src/actions/readContract.server");
+
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.resolve({
+        jsonrpc: "2.0",
+        id: 1,
+        result: "0x0000000000000000000000000000000000000000000000000de0b6b3a7640000",
+      }),
+    });
+
+    const result = await readContractHandler({
+      chainId: 1,
+      args: {
+        address: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+        data: "0x70a08231000000000000000000000000742d35Cc6634C0532925a3b844Bc9e7595f2bD18",
+      },
+      env: mockEnv as any,
+    });
+
+    expect(result.result).toBe("0x0000000000000000000000000000000000000000000000000de0b6b3a7640000");
+  });
+
+  it("should execute getCode handler and return undefined for empty code", async () => {
+    const { getCodeHandler } = await import("../src/actions/getCode.server");
+
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.resolve({
+        jsonrpc: "2.0",
+        id: 1,
+        result: "0x",
+      }),
+    });
+
+    const result = await getCodeHandler({
+      chainId: 1,
+      args: { address: "0x742d35Cc6634C0532925a3b844Bc9e7595f2bD18" },
+      env: mockEnv as any,
+    });
+
+    expect(result.result).toBeUndefined();
+  });
+
+  it("should throw when all RPC endpoints fail", async () => {
+    const { getBalanceHandler } = await import("../src/actions/getBalance.server");
+
+    mockFetch
+      .mockRejectedValueOnce(new Error("RPC 1 failed"))
+      .mockRejectedValueOnce(new Error("RPC 2 failed"))
+      .mockRejectedValueOnce(new Error("RPC 3 failed"));
+
+    await expect(
+      getBalanceHandler({
+        chainId: 1,
+        args: { address: "0x742d35Cc6634C0532925a3b844Bc9e7595f2bD18" },
+        env: mockEnv as any,
+      })
+    ).rejects.toThrow("All RPC endpoints failed");
+  });
+
+  it("should throw for unsupported chain ID", async () => {
+    const { getBalanceHandler } = await import("../src/actions/getBalance.server");
+
+    await expect(
+      getBalanceHandler({
+        chainId: 99999,
+        args: { address: "0x742d35Cc6634C0532925a3b844Bc9e7595f2bD18" },
+        env: mockEnv as any,
+      })
+    ).rejects.toThrow("Unsupported chain ID");
+  });
+
+  it("should use incrementing IDs instead of Date.now()", async () => {
+    const { getGasPriceHandler } = await import("../src/actions/getGasPrice.server");
+
+    mockFetch
+      .mockResolvedValueOnce({
+        ok: true,
+        json: () => Promise.resolve({ jsonrpc: "2.0", id: 1, result: "0x1" }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: () => Promise.resolve({ jsonrpc: "2.0", id: 2, result: "0x2" }),
+      });
+
+    await getGasPriceHandler({ chainId: 1, args: {}, env: mockEnv as any });
+    await getGasPriceHandler({ chainId: 1, args: {}, env: mockEnv as any });
+
+    const call1Body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    const call2Body = JSON.parse(mockFetch.mock.calls[1][1].body);
+    expect(call2Body.id).toBeGreaterThan(call1Body.id);
+    expect(call2Body.id - call1Body.id).toBe(1);
+  });
+});

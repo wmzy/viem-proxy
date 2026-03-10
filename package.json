@@ -55,10 +55,8 @@
   "peerDependencies": {
     "viem": "^2.0.0"
   },
-  "dependencies": {
-    "viem": "^2.21.1"
-  },
   "devDependencies": {
+    "viem": "^2.21.1",
     "@types/node": "^20.10.0",
     "@typescript-eslint/eslint-plugin": "^6.13.0",
     "@typescript-eslint/parser": "^6.13.0",

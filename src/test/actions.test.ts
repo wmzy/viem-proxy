@@ -5,7 +5,6 @@ import { proxyActions } from "../actions/proxyActions";
 import { getBalance } from "../actions/getBalance.client";
 import { getBlockNumber } from "../actions/getBlockNumber.client";
 
-// Store original fetch
 const originalFetch = global.fetch;
 
 describe("Modular Actions", () => {
@@ -14,37 +13,36 @@ describe("Modular Actions", () => {
   });
 
   afterEach(() => {
-    // Restore original fetch
     global.fetch = originalFetch;
   });
 
   describe("proxyActions extend pattern", () => {
     it("should extend client with proxy actions", () => {
-      const client = createPublicClient({
+      const base = createPublicClient({
         chain: mainnet,
         transport: http(),
-      }).extend(
-        proxyActions({
-          endpoint: "https://proxy.example.com",
-        })
-      );
+      });
+      const actions = proxyActions({
+        endpoint: "https://proxy.example.com",
+      });
+      const extended = actions(base);
 
-      expect(client.getBalance).toBeDefined();
-      expect(client.getBlock).toBeDefined();
-      expect(client.getBlockNumber).toBeDefined();
-      expect(client.getTransaction).toBeDefined();
-      expect(client.getTransactionReceipt).toBeDefined();
-      expect(client.readContract).toBeDefined();
-      expect(client.call).toBeDefined();
-      expect(client.estimateGas).toBeDefined();
-      expect(client.getGasPrice).toBeDefined();
-      expect(client.getLogs).toBeDefined();
-      expect(client.getCode).toBeDefined();
+      expect(extended.getBalance).toBeDefined();
+      expect(extended.getBlock).toBeDefined();
+      expect(extended.getBlockNumber).toBeDefined();
+      expect(extended.getTransaction).toBeDefined();
+      expect(extended.getTransactionReceipt).toBeDefined();
+      expect(extended.readContract).toBeDefined();
+      expect(extended.call).toBeDefined();
+      expect(extended.estimateGas).toBeDefined();
+      expect(extended.getGasPrice).toBeDefined();
+      expect(extended.getLogs).toBeDefined();
+      expect(extended.getCode).toBeDefined();
     });
   });
 
   describe("standalone action usage", () => {
-    it("should call getBalance with proxy config", async () => {
+    it("should call getBalance with proxy config via GET", async () => {
       const mockFetch = vi.fn().mockResolvedValueOnce({
         json: () =>
           Promise.resolve({
@@ -67,16 +65,14 @@ describe("Modular Actions", () => {
       });
 
       expect(balance).toBe(BigInt("0x1234"));
-      expect(mockFetch).toHaveBeenCalledWith(
-        "https://proxy.example.com/api/v1/1/getBalance",
-        expect.objectContaining({
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-        })
-      );
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+      const [url, opts] = mockFetch.mock.calls[0];
+      expect(url).toContain("https://proxy.example.com/api/v1/1/getBalance");
+      expect(url).toContain("?p=");
+      expect(opts.method).toBe("GET");
     });
 
-    it("should call getBlockNumber with proxy config", async () => {
+    it("should call getBlockNumber with proxy config via GET", async () => {
       const mockFetch = vi.fn().mockResolvedValueOnce({
         json: () =>
           Promise.resolve({
@@ -98,23 +94,47 @@ describe("Modular Actions", () => {
       });
 
       expect(blockNumber).toBe(BigInt("0xabcdef"));
-      expect(mockFetch).toHaveBeenCalledWith(
-        "https://proxy.example.com/api/v1/1/getBlockNumber",
-        expect.objectContaining({
-          method: "POST",
-        })
-      );
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+      const [url, opts] = mockFetch.mock.calls[0];
+      expect(url).toContain("https://proxy.example.com/api/v1/1/getBlockNumber");
+      expect(url).toContain("?p=");
+      expect(opts.method).toBe("GET");
+    });
+
+    it("should include API key header when configured", async () => {
+      const mockFetch = vi.fn().mockResolvedValueOnce({
+        json: () =>
+          Promise.resolve({
+            result: "0x1234",
+            timestamp: Date.now(),
+          }),
+      });
+      global.fetch = mockFetch;
+
+      const client = createPublicClient({
+        chain: mainnet,
+        transport: http(),
+      });
+
+      await getBalance(client, {
+        address: "0x1234567890123456789012345678901234567890",
+        proxy: {
+          endpoint: "https://proxy.example.com",
+          apiKey: "test-key-123",
+        },
+      });
+
+      const [, opts] = mockFetch.mock.calls[0];
+      expect(opts.headers?.["X-API-Key"]).toBe("test-key-123");
     });
 
     it("should fallback to direct RPC on proxy error", async () => {
       let callCount = 0;
-      const mockFetch = vi.fn().mockImplementation((url: string) => {
+      const mockFetch = vi.fn().mockImplementation((_url: string) => {
         callCount++;
         if (callCount === 1) {
-          // First call to proxy fails
           return Promise.reject(new Error("Proxy error"));
         }
-        // Subsequent calls to direct RPC succeed
         return Promise.resolve({
           ok: true,
           headers: new Headers({ "content-type": "application/json" }),
@@ -141,7 +161,6 @@ describe("Modular Actions", () => {
         },
       });
 
-      // Should have called proxy first, then fallback
       expect(mockFetch).toHaveBeenCalledTimes(2);
       expect(balance).toBe(BigInt("0x5678"));
     });
@@ -191,7 +210,6 @@ describe("Modular Actions", () => {
       });
 
       expect(balance).toBe(BigInt("0x9999"));
-      // Should call direct RPC, not proxy
       expect(mockFetch).toHaveBeenCalledWith(
         "https://eth.llamarpc.com",
         expect.anything()

@@ -13,10 +13,6 @@ describe("Chains re-exports", () => {
     expect(chains).toBeDefined();
     expect(typeof chains).toBe("object");
     
-    // Since chains.ts only re-exports viem chains, we just check it behaves as expected
-    const viemChains = await import("viem/chains");
-    
-    // All viem chains should be available
     const chainNames = ['mainnet', 'sepolia', 'goerli', 'polygon', 'arbitrum', 'optimism'];
     
     chainNames.forEach(chainName => {

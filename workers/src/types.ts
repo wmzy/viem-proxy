@@ -6,6 +6,9 @@ export type Env = {
   MAX_CACHE_TTL: string;
   DEFAULT_CACHE_TTL: string;
   COMPRESSION_THRESHOLD: string;
+  FINALIZED_BLOCK_CACHE_TTL: string;
+  API_KEY?: string;
+  RPC_URLS?: string;
 };
 
 export type RpcRequest = {

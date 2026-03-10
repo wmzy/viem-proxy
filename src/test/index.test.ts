@@ -71,7 +71,7 @@ describe("Index exports", () => {
     });
 
     expect(client).toBeDefined();
-    expect(client.proxy?.endpoint).toBe("https://proxy.example.com");
+    expect(client.proxy.endpoint).toBe("https://proxy.example.com");
   });
 
   it("should export compression utils", async () => {
