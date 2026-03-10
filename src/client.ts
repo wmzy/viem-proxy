@@ -8,6 +8,7 @@ import {
 } from "viem";
 import type { ProxyPublicClient, ProxyConfig, RpcRequest, RpcResponse, PerformanceMetrics } from "./types";
 import { proxyActions } from "./actions/proxyActions";
+import { withProxy } from "./proxy";
 
 const DEFAULT_PROXY_CONFIG: ProxyConfig = {
   enabled: true,
@@ -40,14 +41,13 @@ type CreatePublicClientConfig<
  * @example
  * // Using extend pattern (recommended for tree-shaking)
  * import { createPublicClient, http } from 'viem'
+ * import { withProxy } from 'viem-proxy'
  * import { proxyActions } from 'viem-proxy/actions'
  *
- * const client = createPublicClient({
- *   chain: mainnet,
- *   transport: http()
- * }).extend(proxyActions({
- *   endpoint: 'https://proxy.example.com'
- * }))
+ * const client = withProxy(
+ *   createPublicClient({ chain: mainnet, transport: http() }),
+ *   { endpoint: 'https://proxy.example.com' }
+ * ).extend(proxyActions)
  */
 export const createPublicClient = <
   TChain extends Chain | undefined = undefined,
@@ -150,15 +150,15 @@ export const createPublicClient = <
     return Object.assign(baseClient, helperMethods) as ProxyPublicClient<TTransport, TChain>;
   }
 
-  const extendedClient = (baseClient as any).extend(
-    proxyActions({
-      endpoint: finalProxyConfig.endpoint,
-      timeout: finalProxyConfig.timeout,
-      fallback: finalProxyConfig.fallback,
-      debug: finalProxyConfig.debug,
-      apiKey: finalProxyConfig.apiKey,
-    })
-  );
+  const proxiedClient = withProxy(baseClient, {
+    endpoint: finalProxyConfig.endpoint,
+    timeout: finalProxyConfig.timeout,
+    fallback: finalProxyConfig.fallback,
+    debug: finalProxyConfig.debug,
+    apiKey: finalProxyConfig.apiKey,
+  });
+
+  const extendedClient = (proxiedClient as any).extend(proxyActions);
 
   return Object.assign(extendedClient, helperMethods) as ProxyPublicClient<TTransport, TChain>;
 };

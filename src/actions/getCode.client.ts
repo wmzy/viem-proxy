@@ -1,6 +1,6 @@
 import type { Client, Chain, Transport } from "viem";
 import { getCode as viemGetCode } from "viem/actions";
-import type { ProxyActionConfig } from "./types";
+import { getProxyConfig } from "../proxy";
 import { makeProxyRequest } from "./utils";
 
 export type GetCodeParameters = {
@@ -16,13 +16,13 @@ export type GetCodeReturnType = `0x${string}` | undefined;
  */
 export const getCode = async <TChain extends Chain | undefined>(
   client: Client<Transport, TChain>,
-  args: GetCodeParameters & { proxy?: ProxyActionConfig }
+  args: GetCodeParameters
 ): Promise<GetCodeReturnType> => {
-  const { proxy, ...params } = args;
+  const proxy = getProxyConfig(client);
   const chainId = client.chain?.id ?? 1;
 
   if (!proxy?.endpoint) {
-    return viemGetCode(client, params as any);
+    return viemGetCode(client, args as any);
   }
 
   try {
@@ -30,9 +30,9 @@ export const getCode = async <TChain extends Chain | undefined>(
       "getCode",
       chainId,
       {
-        address: params.address,
-        blockTag: params.blockTag,
-        blockNumber: params.blockNumber?.toString(),
+        address: args.address,
+        blockTag: args.blockTag,
+        blockNumber: args.blockNumber?.toString(),
       },
       proxy
     );
@@ -42,7 +42,7 @@ export const getCode = async <TChain extends Chain | undefined>(
       if (proxy.debug) {
         console.warn("[viem-proxy] Fallback to direct RPC:", error);
       }
-      return viemGetCode(client, params as any);
+      return viemGetCode(client, args as any);
     }
     throw error;
   }

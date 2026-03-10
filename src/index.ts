@@ -22,6 +22,9 @@ export type {
 
 export { createPublicClient } from "./client";
 
+// Export proxy utilities
+export { withProxy, getProxyConfig } from "./proxy";
+
 // Export proxyActions for extend pattern
 export { proxyActions } from "./actions/proxyActions";
 export type { ProxyActionsReturnType } from "./actions/proxyActions";

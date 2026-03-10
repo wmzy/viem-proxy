@@ -1,6 +1,6 @@
 import type { Client, Chain, Transport, Block } from "viem";
 import { getBlock as viemGetBlock } from "viem/actions";
-import type { ProxyActionConfig } from "./types";
+import { getProxyConfig } from "../proxy";
 import { makeProxyRequest } from "./utils";
 
 export type GetBlockParameters = {
@@ -17,9 +17,10 @@ export type GetBlockReturnType = Block;
  */
 export const getBlock = async <TChain extends Chain | undefined>(
   client: Client<Transport, TChain>,
-  args?: GetBlockParameters & { proxy?: ProxyActionConfig }
+  args?: GetBlockParameters
 ): Promise<GetBlockReturnType> => {
-  const { proxy, ...params } = args ?? {};
+  const proxy = getProxyConfig(client);
+  const params = args ?? {};
   const chainId = client.chain?.id ?? 1;
 
   if (!proxy?.endpoint) {

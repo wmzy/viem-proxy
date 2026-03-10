@@ -1,6 +1,6 @@
 import type { Client, Chain, Transport, Transaction } from "viem";
 import { getTransaction as viemGetTransaction } from "viem/actions";
-import type { ProxyActionConfig } from "./types";
+import { getProxyConfig } from "../proxy";
 import { makeProxyRequest } from "./utils";
 
 export type GetTransactionParameters = {
@@ -14,20 +14,20 @@ export type GetTransactionReturnType = Transaction;
  */
 export const getTransaction = async <TChain extends Chain | undefined>(
   client: Client<Transport, TChain>,
-  args: GetTransactionParameters & { proxy?: ProxyActionConfig }
+  args: GetTransactionParameters
 ): Promise<GetTransactionReturnType> => {
-  const { proxy, ...params } = args;
+  const proxy = getProxyConfig(client);
   const chainId = client.chain?.id ?? 1;
 
   if (!proxy?.endpoint) {
-    return viemGetTransaction(client, params as any) as Promise<GetTransactionReturnType>;
+    return viemGetTransaction(client, args as any) as Promise<GetTransactionReturnType>;
   }
 
   try {
     const result = await makeProxyRequest<GetTransactionReturnType>(
       "getTransaction",
       chainId,
-      { hash: params.hash },
+      { hash: args.hash },
       proxy
     );
     return result;
@@ -36,7 +36,7 @@ export const getTransaction = async <TChain extends Chain | undefined>(
       if (proxy.debug) {
         console.warn("[viem-proxy] Fallback to direct RPC:", error);
       }
-      return viemGetTransaction(client, params as any) as Promise<GetTransactionReturnType>;
+      return viemGetTransaction(client, args as any) as Promise<GetTransactionReturnType>;
     }
     throw error;
   }

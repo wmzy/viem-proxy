@@ -43,6 +43,18 @@ describe("Index exports", () => {
     expect(typeof exports.createPublicClient).toBe("function");
   });
 
+  it("should export withProxy function", async () => {
+    const exports = await import("../index");
+    expect(exports.withProxy).toBeDefined();
+    expect(typeof exports.withProxy).toBe("function");
+  });
+
+  it("should export getProxyConfig function", async () => {
+    const exports = await import("../index");
+    expect(exports.getProxyConfig).toBeDefined();
+    expect(typeof exports.getProxyConfig).toBe("function");
+  });
+
   it("should re-export viem exports", async () => {
     const exports = await import("../index");
 

@@ -1,7 +1,7 @@
 import type { Client, Chain, Transport, Abi } from "viem";
 import { encodeFunctionData, decodeFunctionResult } from "viem";
 import { readContract as viemReadContract } from "viem/actions";
-import type { ProxyActionConfig } from "./types";
+import { getProxyConfig } from "../proxy";
 import { makeProxyRequest } from "./utils";
 
 export type ReadContractParameters = {
@@ -18,39 +18,37 @@ export type ReadContractParameters = {
  */
 export const readContract = async <TChain extends Chain | undefined>(
   client: Client<Transport, TChain>,
-  args: ReadContractParameters & { proxy?: ProxyActionConfig }
+  args: ReadContractParameters
 ): Promise<unknown> => {
-  const { proxy, ...params } = args;
+  const proxy = getProxyConfig(client);
   const chainId = client.chain?.id ?? 1;
 
   if (!proxy?.endpoint) {
-    return viemReadContract(client, params as any);
+    return viemReadContract(client, args as any);
   }
 
   try {
-    // Encode the call data on client side
     const data = encodeFunctionData({
-      abi: params.abi,
-      functionName: params.functionName,
-      args: params.args ?? [],
+      abi: args.abi,
+      functionName: args.functionName,
+      args: args.args ?? [],
     });
 
     const result = await makeProxyRequest<string>(
       "readContract",
       chainId,
       {
-        address: params.address,
+        address: args.address,
         data,
-        blockTag: params.blockTag,
-        blockNumber: params.blockNumber?.toString(),
+        blockTag: args.blockTag,
+        blockNumber: args.blockNumber?.toString(),
       },
       proxy
     );
 
-    // Decode the result on client side
     return decodeFunctionResult({
-      abi: params.abi,
-      functionName: params.functionName,
+      abi: args.abi,
+      functionName: args.functionName,
       data: result as `0x${string}`,
     });
   } catch (error) {
@@ -58,7 +56,7 @@ export const readContract = async <TChain extends Chain | undefined>(
       if (proxy.debug) {
         console.warn("[viem-proxy] Fallback to direct RPC:", error);
       }
-      return viemReadContract(client, params as any);
+      return viemReadContract(client, args as any);
     }
     throw error;
   }

@@ -1,6 +1,6 @@
 import type { Client, Chain, Transport } from "viem";
 import { getGasPrice as viemGetGasPrice } from "viem/actions";
-import type { ProxyActionConfig } from "./types";
+import { getProxyConfig } from "../proxy";
 import { makeProxyRequest } from "./utils";
 
 export type GetGasPriceReturnType = bigint;
@@ -9,10 +9,9 @@ export type GetGasPriceReturnType = bigint;
  * Get the current gas price through proxy
  */
 export const getGasPrice = async <TChain extends Chain | undefined>(
-  client: Client<Transport, TChain>,
-  args?: { proxy?: ProxyActionConfig }
+  client: Client<Transport, TChain>
 ): Promise<GetGasPriceReturnType> => {
-  const proxy = args?.proxy;
+  const proxy = getProxyConfig(client);
   const chainId = client.chain?.id ?? 1;
 
   if (!proxy?.endpoint) {

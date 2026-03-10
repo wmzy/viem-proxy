@@ -1,6 +1,6 @@
 import type { Client, Chain, Transport } from "viem";
 import { getBalance as viemGetBalance } from "viem/actions";
-import type { ProxyActionConfig } from "./types";
+import { getProxyConfig } from "../proxy";
 import { makeProxyRequest } from "./utils";
 
 export type GetBalanceParameters = {
@@ -15,23 +15,19 @@ export type GetBalanceReturnType = bigint;
  * Get the balance of an address through proxy
  *
  * @example
- * // Standalone usage
+ * // Standalone usage (client must have proxy config via withProxy)
  * import { getBalance } from 'viem-proxy/actions'
- * const balance = await getBalance(client, {
- *   address: '0x...',
- *   proxy: { endpoint: 'https://proxy.example.com' }
- * })
+ * const balance = await getBalance(client, { address: '0x...' })
  */
 export const getBalance = async <TChain extends Chain | undefined>(
   client: Client<Transport, TChain>,
-  args: GetBalanceParameters & { proxy?: ProxyActionConfig }
+  args: GetBalanceParameters
 ): Promise<GetBalanceReturnType> => {
-  const { proxy, ...params } = args;
+  const proxy = getProxyConfig(client);
   const chainId = client.chain?.id ?? 1;
 
-  // If no proxy config, use direct viem call
   if (!proxy?.endpoint) {
-    return viemGetBalance(client, params as any);
+    return viemGetBalance(client, args as any);
   }
 
   try {
@@ -39,9 +35,9 @@ export const getBalance = async <TChain extends Chain | undefined>(
       "getBalance",
       chainId,
       {
-        address: params.address,
-        blockTag: params.blockTag,
-        blockNumber: params.blockNumber?.toString(),
+        address: args.address,
+        blockTag: args.blockTag,
+        blockNumber: args.blockNumber?.toString(),
       },
       proxy
     );
@@ -51,7 +47,7 @@ export const getBalance = async <TChain extends Chain | undefined>(
       if (proxy.debug) {
         console.warn("[viem-proxy] Fallback to direct RPC:", error);
       }
-      return viemGetBalance(client, params as any);
+      return viemGetBalance(client, args as any);
     }
     throw error;
   }

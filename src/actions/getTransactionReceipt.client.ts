@@ -1,6 +1,6 @@
 import type { Client, Chain, Transport, TransactionReceipt } from "viem";
 import { getTransactionReceipt as viemGetTransactionReceipt } from "viem/actions";
-import type { ProxyActionConfig } from "./types";
+import { getProxyConfig } from "../proxy";
 import { makeProxyRequest } from "./utils";
 
 export type GetTransactionReceiptParameters = {
@@ -14,20 +14,20 @@ export type GetTransactionReceiptReturnType = TransactionReceipt;
  */
 export const getTransactionReceipt = async <TChain extends Chain | undefined>(
   client: Client<Transport, TChain>,
-  args: GetTransactionReceiptParameters & { proxy?: ProxyActionConfig }
+  args: GetTransactionReceiptParameters
 ): Promise<GetTransactionReceiptReturnType> => {
-  const { proxy, ...params } = args;
+  const proxy = getProxyConfig(client);
   const chainId = client.chain?.id ?? 1;
 
   if (!proxy?.endpoint) {
-    return viemGetTransactionReceipt(client, params as any) as Promise<GetTransactionReceiptReturnType>;
+    return viemGetTransactionReceipt(client, args as any) as Promise<GetTransactionReceiptReturnType>;
   }
 
   try {
     const result = await makeProxyRequest<GetTransactionReceiptReturnType>(
       "getTransactionReceipt",
       chainId,
-      { hash: params.hash },
+      { hash: args.hash },
       proxy
     );
     return result;
@@ -36,7 +36,7 @@ export const getTransactionReceipt = async <TChain extends Chain | undefined>(
       if (proxy.debug) {
         console.warn("[viem-proxy] Fallback to direct RPC:", error);
       }
-      return viemGetTransactionReceipt(client, params as any) as Promise<GetTransactionReceiptReturnType>;
+      return viemGetTransactionReceipt(client, args as any) as Promise<GetTransactionReceiptReturnType>;
     }
     throw error;
   }

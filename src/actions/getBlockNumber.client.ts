@@ -1,6 +1,6 @@
 import type { Client, Chain, Transport } from "viem";
 import { getBlockNumber as viemGetBlockNumber } from "viem/actions";
-import type { ProxyActionConfig } from "./types";
+import { getProxyConfig } from "../proxy";
 import { makeProxyRequest } from "./utils";
 
 export type GetBlockNumberReturnType = bigint;
@@ -9,10 +9,9 @@ export type GetBlockNumberReturnType = bigint;
  * Get the current block number through proxy
  */
 export const getBlockNumber = async <TChain extends Chain | undefined>(
-  client: Client<Transport, TChain>,
-  args?: { proxy?: ProxyActionConfig }
+  client: Client<Transport, TChain>
 ): Promise<GetBlockNumberReturnType> => {
-  const proxy = args?.proxy;
+  const proxy = getProxyConfig(client);
   const chainId = client.chain?.id ?? 1;
 
   if (!proxy?.endpoint) {
