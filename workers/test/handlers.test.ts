@@ -359,6 +359,7 @@ describe("Action Handlers", () => {
 
   it("should throw when all RPC endpoints fail", async () => {
     const { getBalanceHandler } = await import("../src/actions/getBalance.server");
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
 
     mockFetch
       .mockRejectedValueOnce(new Error("RPC 1 failed"))
@@ -372,6 +373,8 @@ describe("Action Handlers", () => {
         env: mockEnv as any,
       })
     ).rejects.toThrow("All RPC endpoints failed");
+
+    spy.mockRestore();
   });
 
   it("should throw for unsupported chain ID", async () => {

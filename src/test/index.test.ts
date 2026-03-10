@@ -103,4 +103,21 @@ describe("Index exports", () => {
     expect(viemChains.mainnet).toBeDefined();
     expect(viemChains.sepolia).toBeDefined();
   });
+
+  it("should export all actions from actions/index", async () => {
+    const actions = await import("../actions/index");
+
+    expect(actions.getBalance).toBeDefined();
+    expect(actions.getBlock).toBeDefined();
+    expect(actions.getBlockNumber).toBeDefined();
+    expect(actions.getTransaction).toBeDefined();
+    expect(actions.getTransactionReceipt).toBeDefined();
+    expect(actions.readContract).toBeDefined();
+    expect(actions.call).toBeDefined();
+    expect(actions.estimateGas).toBeDefined();
+    expect(actions.getGasPrice).toBeDefined();
+    expect(actions.getLogs).toBeDefined();
+    expect(actions.getCode).toBeDefined();
+    expect(actions.proxyActions).toBeDefined();
+  });
 });

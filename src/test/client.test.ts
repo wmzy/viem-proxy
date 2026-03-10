@@ -1,18 +1,24 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import type { Chain } from "viem";
 import { createPublicClient } from "../client";
 
+const CHAIN = {
+  id: 1,
+  name: "Mainnet",
+  nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 },
+  rpcUrls: { default: { http: ["https://eth.llamarpc.com"] } },
+};
+
+const originalFetch = global.fetch;
+
 describe("Client", () => {
+  afterEach(() => {
+    global.fetch = originalFetch;
+  });
+
   describe("createPublicClient", () => {
     it("should create proxy client with default config", () => {
-      const client = createPublicClient({
-        chain: {
-          id: 1,
-          name: "Mainnet",
-          nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 },
-          rpcUrls: { default: { http: ["https://eth.llamarpc.com"] } },
-        },
-      });
+      const client = createPublicClient({ chain: CHAIN });
 
       expect(client).toBeDefined();
       expect(client.proxy).toBeDefined();
@@ -23,12 +29,7 @@ describe("Client", () => {
 
     it("should create client with custom proxy config", () => {
       const client = createPublicClient({
-        chain: {
-          id: 1,
-          name: "Mainnet",
-          nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 },
-          rpcUrls: { default: { http: ["https://eth.llamarpc.com"] } },
-        },
+        chain: CHAIN,
         proxy: {
           enabled: true,
           endpoint: "https://proxy.example.com",
@@ -54,19 +55,11 @@ describe("Client", () => {
       } as Chain;
 
       const client = createPublicClient({ chain });
-
       expect(client.chain).toEqual(chain);
     });
 
     it("should extend client with proxy methods", () => {
-      const client = createPublicClient({
-        chain: {
-          id: 1,
-          name: "Mainnet",
-          nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 },
-          rpcUrls: { default: { http: ["https://eth.llamarpc.com"] } },
-        },
-      });
+      const client = createPublicClient({ chain: CHAIN });
 
       expect(client.getCacheStats).toBeDefined();
       expect(client.clearCache).toBeDefined();
@@ -77,18 +70,10 @@ describe("Client", () => {
 
     it("should have proxied read methods when endpoint is set", () => {
       const client = createPublicClient({
-        chain: {
-          id: 1,
-          name: "Mainnet",
-          nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 },
-          rpcUrls: { default: { http: ["https://eth.llamarpc.com"] } },
-        },
-        proxy: {
-          endpoint: "https://proxy.example.com",
-        },
+        chain: CHAIN,
+        proxy: { endpoint: "https://proxy.example.com" },
       });
 
-      // These methods should be overridden with proxy versions
       expect(client.getBalance).toBeDefined();
       expect(client.getBlock).toBeDefined();
       expect(client.getBlockNumber).toBeDefined();
@@ -101,20 +86,33 @@ describe("Client", () => {
       expect(client.getLogs).toBeDefined();
       expect(client.getCode).toBeDefined();
     });
+
+    it("should not extend with proxyActions when proxy is disabled", () => {
+      const client = createPublicClient({
+        chain: CHAIN,
+        proxy: { enabled: false, endpoint: "https://proxy.example.com" },
+      });
+
+      expect(client.proxy.enabled).toBe(false);
+      expect(client.getCacheStats).toBeDefined();
+    });
+
+    it("should not extend with proxyActions when endpoint is empty", () => {
+      const client = createPublicClient({
+        chain: CHAIN,
+        proxy: { enabled: true, endpoint: "" },
+      });
+
+      expect(client.proxy.endpoint).toBe("");
+      expect(client.getCacheStats).toBeDefined();
+    });
   });
 
   describe("proxy client methods", () => {
     let client: ReturnType<typeof createPublicClient>;
 
     beforeEach(() => {
-      client = createPublicClient({
-        chain: {
-          id: 1,
-          name: "Mainnet",
-          nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 },
-          rpcUrls: { default: { http: ["https://eth.llamarpc.com"] } },
-        },
-      });
+      client = createPublicClient({ chain: CHAIN });
     });
 
     it("should implement getCacheStats", async () => {
@@ -144,33 +142,161 @@ describe("Client", () => {
       expect(result).toBe(true);
     });
 
-    it("should implement preheatCache", async () => {
+    it("should implement preheatCache returning empty results when no endpoint", async () => {
       const requests = [
-        {
-          jsonrpc: "2.0" as const,
-          id: 1,
-          method: "eth_getBalance",
-          params: ["0x123", "latest"],
-        },
+        { jsonrpc: "2.0" as const, id: 1, method: "eth_getBalance", params: ["0x123", "latest"] },
       ];
 
       const result = await client.preheatCache(requests);
 
       expect(result).toBeInstanceOf(Array);
       expect(result).toHaveLength(1);
+      expect(result[0].result).toBeNull();
+    });
+  });
+
+  describe("debug mode logging", () => {
+    it("should log on clearCache when debug is enabled", async () => {
+      const spy = vi.spyOn(console, "log").mockImplementation(() => {});
+      const client = createPublicClient({
+        chain: CHAIN,
+        proxy: { debug: true },
+      });
+
+      await client.clearCache();
+      expect(spy).toHaveBeenCalledWith("[viem-proxy] Cache cleared");
+      spy.mockRestore();
+    });
+
+    it("should not log on clearCache when debug is disabled", async () => {
+      const spy = vi.spyOn(console, "log").mockImplementation(() => {});
+      const client = createPublicClient({
+        chain: CHAIN,
+        proxy: { debug: false },
+      });
+
+      await client.clearCache();
+      expect(spy).not.toHaveBeenCalledWith("[viem-proxy] Cache cleared");
+      spy.mockRestore();
+    });
+
+    it("should log on clearMetrics when debug is enabled", async () => {
+      const spy = vi.spyOn(console, "log").mockImplementation(() => {});
+      const client = createPublicClient({
+        chain: CHAIN,
+        proxy: { debug: true },
+      });
+
+      await client.clearMetrics();
+      expect(spy).toHaveBeenCalledWith("[viem-proxy] Metrics cleared");
+      spy.mockRestore();
+    });
+  });
+
+  describe("preheatCache with endpoint", () => {
+    it("should send POST requests to proxy endpoint", async () => {
+      const mockFetch = vi.fn().mockResolvedValue({
+        json: () => Promise.resolve({ jsonrpc: "2.0", id: 1, result: "0x1" }),
+      });
+      global.fetch = mockFetch;
+
+      const client = createPublicClient({
+        chain: CHAIN,
+        proxy: { endpoint: "https://proxy.example.com" },
+      });
+
+      const requests = [
+        { jsonrpc: "2.0" as const, id: 1, method: "eth_getBalance", params: ["0x123", "latest"] },
+        { jsonrpc: "2.0" as const, id: 2, method: "eth_blockNumber", params: [] },
+      ];
+
+      const results = await client.preheatCache(requests);
+
+      expect(results).toHaveLength(2);
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+      expect(mockFetch.mock.calls[0][0]).toContain("https://proxy.example.com/api/v1/direct/1/eth_getBalance");
+      expect(mockFetch.mock.calls[0][1].method).toBe("POST");
+    });
+
+    it("should include API key in preheatCache requests", async () => {
+      const mockFetch = vi.fn().mockResolvedValue({
+        json: () => Promise.resolve({ jsonrpc: "2.0", id: 1, result: "0x1" }),
+      });
+      global.fetch = mockFetch;
+
+      const client = createPublicClient({
+        chain: CHAIN,
+        proxy: { endpoint: "https://proxy.example.com", apiKey: "my-key" },
+      });
+
+      await client.preheatCache([
+        { jsonrpc: "2.0" as const, id: 1, method: "eth_getBalance", params: [] },
+      ]);
+
+      expect(mockFetch.mock.calls[0][1].headers["X-API-Key"]).toBe("my-key");
+    });
+
+    it("should handle preheatCache fetch failures gracefully", async () => {
+      const mockFetch = vi.fn().mockRejectedValue(new Error("network error"));
+      global.fetch = mockFetch;
+
+      const client = createPublicClient({
+        chain: CHAIN,
+        proxy: { endpoint: "https://proxy.example.com" },
+      });
+
+      const requests = [
+        { jsonrpc: "2.0" as const, id: 1, method: "eth_getBalance", params: [] },
+      ];
+
+      const results = await client.preheatCache(requests);
+      expect(results).toHaveLength(1);
+      expect(results[0].result).toBeNull();
+    });
+
+    it("should handle preheatCache when fetch throws synchronously", async () => {
+      global.fetch = (() => { throw new Error("sync error"); }) as unknown as typeof fetch;
+
+      const client = createPublicClient({
+        chain: CHAIN,
+        proxy: { endpoint: "https://proxy.example.com" },
+      });
+
+      const requests = [
+        { jsonrpc: "2.0" as const, id: 1, method: "eth_getBalance", params: [] },
+      ];
+
+      const results = await client.preheatCache(requests);
+      expect(results).toHaveLength(1);
+      expect(results[0].result).toBeNull();
+    });
+
+    it("should handle individual preheatCache request rejection", async () => {
+      const mockFetch = vi.fn()
+        .mockResolvedValueOnce({ json: () => Promise.resolve({ jsonrpc: "2.0", id: 1, result: "0x1" }) })
+        .mockRejectedValueOnce(new Error("fail"));
+      global.fetch = mockFetch;
+
+      const client = createPublicClient({
+        chain: CHAIN,
+        proxy: { endpoint: "https://proxy.example.com" },
+      });
+
+      const requests = [
+        { jsonrpc: "2.0" as const, id: 1, method: "eth_getBalance", params: [] },
+        { jsonrpc: "2.0" as const, id: 2, method: "eth_blockNumber", params: [] },
+      ];
+
+      const results = await client.preheatCache(requests);
+      expect(results).toHaveLength(2);
+      expect(results[0].result).toBe("0x1");
+      expect(results[1].result).toBeNull();
     });
   });
 
   describe("proxy configuration edge cases", () => {
     it("should handle undefined proxy config", () => {
-      const client = createPublicClient({
-        chain: {
-          id: 1,
-          name: "Mainnet",
-          nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 },
-          rpcUrls: { default: { http: ["https://eth.llamarpc.com"] } },
-        },
-      });
+      const client = createPublicClient({ chain: CHAIN });
 
       expect(client.proxy).toBeDefined();
       expect(client.proxy.enabled).toBe(true);
@@ -178,15 +304,8 @@ describe("Client", () => {
 
     it("should merge partial proxy config with defaults", () => {
       const client = createPublicClient({
-        chain: {
-          id: 1,
-          name: "Mainnet",
-          nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 },
-          rpcUrls: { default: { http: ["https://eth.llamarpc.com"] } },
-        },
-        proxy: {
-          endpoint: "https://custom.proxy.com",
-        },
+        chain: CHAIN,
+        proxy: { endpoint: "https://custom.proxy.com" },
       });
 
       expect(client.proxy.endpoint).toBe("https://custom.proxy.com");
