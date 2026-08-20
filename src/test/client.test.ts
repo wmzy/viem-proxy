@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import type { Chain } from "viem";
 import { createPublicClient } from "../client";
+import { resetMetrics } from "../utils/metrics";
 
 const CHAIN = {
   id: 1,
@@ -71,7 +72,7 @@ describe("Client", () => {
     it("should have proxied read methods when endpoint is set", () => {
       const client = createPublicClient({
         chain: CHAIN,
-        proxy: { endpoint: "https://proxy.example.com" },
+        proxy: { endpoint: "https://proxy.example.com", retryOptions: { attempts: 1, delay: 0 } },
       });
 
       expect(client.getBalance).toBeDefined();
@@ -112,22 +113,72 @@ describe("Client", () => {
     let client: ReturnType<typeof createPublicClient>;
 
     beforeEach(() => {
+      resetMetrics();
       client = createPublicClient({ chain: CHAIN });
     });
 
-    it("should implement getCacheStats", async () => {
-      const stats = await client.getCacheStats();
+    it("should implement getCacheStats", () => {
+      const stats = client.getCacheStats();
 
       expect(stats).toEqual({
-        hitRate: 0,
         totalRequests: 0,
+        errorCount: 0,
+        errorRate: 0,
         cacheHits: 0,
         cacheMisses: 0,
+        cacheHitRate: 0,
+        averageResponseTime: 0,
+        responseTimeP50: 0,
+        responseTimeP95: 0,
+        responseTimeP99: 0,
+        chainIds: [],
+        strategyCounts: { compressed: 0, "hash-reference": 0, direct: 0 },
+        methodStats: {},
       });
     });
 
-    it("should implement clearCache", async () => {
-      await expect(client.clearCache()).resolves.toBeUndefined();
+    it("should implement clearCache", () => {
+      expect(() => client.clearCache()).not.toThrow();
+    });
+
+    it("should reflect proxy request metrics in getCacheStats", async () => {
+      global.fetch = vi.fn().mockResolvedValueOnce({
+        headers: new Headers({ "X-Cache": "HIT" }),
+        json: () => Promise.resolve({ result: "0x1" }),
+      });
+      const proxied = createPublicClient({
+        chain: CHAIN,
+        proxy: { endpoint: "https://proxy.example.com", retryOptions: { attempts: 1, delay: 0 } },
+      });
+
+      await proxied.getBalance({ address: "0x1234567890123456789012345678901234567890" });
+
+      const stats = proxied.getCacheStats();
+      expect(stats.totalRequests).toBe(1);
+      expect(stats.cacheHits).toBe(1);
+      expect(stats.cacheHitRate).toBe(1);
+      expect(stats.methodStats.getBalance.count).toBe(1);
+      expect(stats.chainIds).toEqual([1]);
+    });
+
+    it("should reset local metrics via clearCache", async () => {
+      global.fetch = vi.fn().mockResolvedValueOnce({
+        headers: new Headers({ "X-Cache": "MISS" }),
+        json: () => Promise.resolve({ result: "0x1" }),
+      });
+      const proxied = createPublicClient({
+        chain: CHAIN,
+        proxy: { endpoint: "https://proxy.example.com", retryOptions: { attempts: 1, delay: 0 } },
+      });
+
+      await proxied.getBalance({ address: "0x1234567890123456789012345678901234567890" });
+      expect(proxied.getCacheStats().totalRequests).toBe(1);
+
+      proxied.clearCache();
+
+      const stats = proxied.getCacheStats();
+      expect(stats.totalRequests).toBe(0);
+      expect(stats.methodStats).toEqual({});
     });
 
     it("should implement getMetrics", async () => {
@@ -142,40 +193,36 @@ describe("Client", () => {
       expect(result).toBe(true);
     });
 
-    it("should implement preheatCache returning empty results when no endpoint", async () => {
-      const requests = [
-        { jsonrpc: "2.0" as const, id: 1, method: "eth_getBalance", params: ["0x123", "latest"] },
-      ];
+    it("should implement preheatCache returning zero counters when no endpoint", async () => {
+      const requests = [{ action: "getBalance" as const, args: { address: "0x123" } }];
 
       const result = await client.preheatCache(requests);
 
-      expect(result).toBeInstanceOf(Array);
-      expect(result).toHaveLength(1);
-      expect(result[0].result).toBeNull();
+      expect(result).toEqual({ submitted: 0, failed: 0 });
     });
   });
 
   describe("debug mode logging", () => {
-    it("should log on clearCache when debug is enabled", async () => {
+    it("should log on clearCache when debug is enabled", () => {
       const spy = vi.spyOn(console, "log").mockImplementation(() => {});
       const client = createPublicClient({
         chain: CHAIN,
         proxy: { debug: true },
       });
 
-      await client.clearCache();
+      client.clearCache();
       expect(spy).toHaveBeenCalledWith("[viem-proxy] Cache cleared");
       spy.mockRestore();
     });
 
-    it("should not log on clearCache when debug is disabled", async () => {
+    it("should not log on clearCache when debug is disabled", () => {
       const spy = vi.spyOn(console, "log").mockImplementation(() => {});
       const client = createPublicClient({
         chain: CHAIN,
         proxy: { debug: false },
       });
 
-      await client.clearCache();
+      client.clearCache();
       expect(spy).not.toHaveBeenCalledWith("[viem-proxy] Cache cleared");
       spy.mockRestore();
     });
@@ -194,33 +241,35 @@ describe("Client", () => {
   });
 
   describe("preheatCache with endpoint", () => {
-    it("should send POST requests to proxy endpoint", async () => {
+    it("should send each item through the cacheable compressed GET path", async () => {
       const mockFetch = vi.fn().mockResolvedValue({
-        json: () => Promise.resolve({ jsonrpc: "2.0", id: 1, result: "0x1" }),
+        json: () => Promise.resolve({ result: "0x1" }),
       });
       global.fetch = mockFetch;
 
       const client = createPublicClient({
         chain: CHAIN,
-        proxy: { endpoint: "https://proxy.example.com" },
+        proxy: { endpoint: "https://proxy.example.com", retryOptions: { attempts: 1, delay: 0 } },
       });
 
       const requests = [
-        { jsonrpc: "2.0" as const, id: 1, method: "eth_getBalance", params: ["0x123", "latest"] },
-        { jsonrpc: "2.0" as const, id: 2, method: "eth_blockNumber", params: [] },
+        { action: "getBalance" as const, args: { address: "0x123" } },
+        { action: "getBlockNumber" as const },
       ];
 
-      const results = await client.preheatCache(requests);
+      const result = await client.preheatCache(requests);
 
-      expect(results).toHaveLength(2);
+      expect(result).toEqual({ submitted: 2, failed: 0 });
       expect(mockFetch).toHaveBeenCalledTimes(2);
-      expect(mockFetch.mock.calls[0][0]).toContain("https://proxy.example.com/api/v1/direct/1/eth_getBalance");
-      expect(mockFetch.mock.calls[0][1].method).toBe("POST");
+      const [firstUrl, firstInit] = mockFetch.mock.calls[0] as [string, RequestInit];
+      expect(firstUrl).toContain("https://proxy.example.com/api/v1/1/getBalance?p=");
+      expect(firstInit.method).toBe("GET");
+      expect(String(mockFetch.mock.calls[1][0])).toContain("/api/v1/1/getBlockNumber?p=");
     });
 
     it("should include API key in preheatCache requests", async () => {
       const mockFetch = vi.fn().mockResolvedValue({
-        json: () => Promise.resolve({ jsonrpc: "2.0", id: 1, result: "0x1" }),
+        json: () => Promise.resolve({ result: "0x1" }),
       });
       global.fetch = mockFetch;
 
@@ -229,11 +278,10 @@ describe("Client", () => {
         proxy: { endpoint: "https://proxy.example.com", apiKey: "my-key" },
       });
 
-      await client.preheatCache([
-        { jsonrpc: "2.0" as const, id: 1, method: "eth_getBalance", params: [] },
-      ]);
+      await client.preheatCache([{ action: "getBalance" as const, args: { address: "0x123" } }]);
 
-      expect(mockFetch.mock.calls[0][1].headers["X-API-Key"]).toBe("my-key");
+      const init = mockFetch.mock.calls[0][1] as RequestInit;
+      expect((init.headers as Record<string, string>)["X-API-Key"]).toBe("my-key");
     });
 
     it("should handle preheatCache fetch failures gracefully", async () => {
@@ -242,16 +290,13 @@ describe("Client", () => {
 
       const client = createPublicClient({
         chain: CHAIN,
-        proxy: { endpoint: "https://proxy.example.com" },
+        proxy: { endpoint: "https://proxy.example.com", retryOptions: { attempts: 1, delay: 0 } },
       });
 
-      const requests = [
-        { jsonrpc: "2.0" as const, id: 1, method: "eth_getBalance", params: [] },
-      ];
+      const requests = [{ action: "getBalance" as const, args: { address: "0x123" } }];
 
-      const results = await client.preheatCache(requests);
-      expect(results).toHaveLength(1);
-      expect(results[0].result).toBeNull();
+      const result = await client.preheatCache(requests);
+      expect(result).toEqual({ submitted: 1, failed: 1 });
     });
 
     it("should handle preheatCache when fetch throws synchronously", async () => {
@@ -259,38 +304,33 @@ describe("Client", () => {
 
       const client = createPublicClient({
         chain: CHAIN,
-        proxy: { endpoint: "https://proxy.example.com" },
+        proxy: { endpoint: "https://proxy.example.com", retryOptions: { attempts: 1, delay: 0 } },
       });
 
-      const requests = [
-        { jsonrpc: "2.0" as const, id: 1, method: "eth_getBalance", params: [] },
-      ];
+      const requests = [{ action: "getBalance" as const, args: { address: "0x123" } }];
 
-      const results = await client.preheatCache(requests);
-      expect(results).toHaveLength(1);
-      expect(results[0].result).toBeNull();
+      const result = await client.preheatCache(requests);
+      expect(result).toEqual({ submitted: 1, failed: 1 });
     });
 
     it("should handle individual preheatCache request rejection", async () => {
       const mockFetch = vi.fn()
-        .mockResolvedValueOnce({ json: () => Promise.resolve({ jsonrpc: "2.0", id: 1, result: "0x1" }) })
+        .mockResolvedValueOnce({ json: () => Promise.resolve({ result: "0x1" }) })
         .mockRejectedValueOnce(new Error("fail"));
       global.fetch = mockFetch;
 
       const client = createPublicClient({
         chain: CHAIN,
-        proxy: { endpoint: "https://proxy.example.com" },
+        proxy: { endpoint: "https://proxy.example.com", retryOptions: { attempts: 1, delay: 0 } },
       });
 
       const requests = [
-        { jsonrpc: "2.0" as const, id: 1, method: "eth_getBalance", params: [] },
-        { jsonrpc: "2.0" as const, id: 2, method: "eth_blockNumber", params: [] },
+        { action: "getBalance" as const, args: { address: "0x123" } },
+        { action: "getBlockNumber" as const },
       ];
 
-      const results = await client.preheatCache(requests);
-      expect(results).toHaveLength(2);
-      expect(results[0].result).toBe("0x1");
-      expect(results[1].result).toBeNull();
+      const result = await client.preheatCache(requests);
+      expect(result).toEqual({ submitted: 2, failed: 1 });
     });
   });
 

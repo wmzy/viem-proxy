@@ -1,5 +1,12 @@
 import type { Client, Chain, Transport } from "viem";
 
+export type ProxyRetryOptions = {
+  /** Total number of attempts including the initial request */
+  attempts: number;
+  /** Base delay in ms between attempts, doubled after each retry */
+  delay: number;
+};
+
 export type ProxyActionConfig = {
   /** Proxy server endpoint */
   endpoint: string;
@@ -11,6 +18,8 @@ export type ProxyActionConfig = {
   debug?: boolean;
   /** API key for authentication */
   apiKey?: string;
+  /** Retry policy for transient failures (network errors, timeouts, 5xx, 429) */
+  retryOptions?: ProxyRetryOptions;
 };
 
 export type ProxyResponse<T> = {

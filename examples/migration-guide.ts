@@ -197,25 +197,35 @@ async function useProxyMethods() {
     },
   });
 
-  // Get cache statistics
-  const stats = await proxyClient.getCacheStats?.();
-  console.log("Cache stats:", stats);
+  // Client-side metrics snapshot (synchronous):
+  // request counts, cache hit rate, error rate, P50/P95/P99, per-method stats
+  const stats = proxyClient.getCacheStats();
+  console.log(`Cache hit rate: ${(stats.cacheHitRate * 100).toFixed(1)}%`);
 
-  // Get performance metrics
-  const metrics = await proxyClient.getMetrics?.();
-  console.log("Metrics:", metrics);
+  // Batch multiple actions in one round trip (per-item isolation)
+  const results = await proxyClient.batch([
+    { id: 1, action: "getBalance", args: { address: "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045" } },
+    { id: 2, action: "getBlockNumber" },
+  ]);
+  console.log("Batch results:", results);
 
-  // Clear cache if needed
-  await proxyClient.clearCache?.();
-  console.log("Cache cleared");
-
-  // Preheat cache with common requests
+  // Preheat cache with common requests (never throws; failures are counted)
   const requests = [
-    { jsonrpc: "2.0" as const, id: 1, method: "eth_blockNumber", params: [] },
-    { jsonrpc: "2.0" as const, id: 2, method: "eth_gasPrice", params: [] },
+    { action: "getBalance" as const, args: { address: "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045" } },
+    { action: "getBlockNumber" as const },
   ];
-  await proxyClient.preheatCache?.(requests);
-  console.log("Cache preheated");
+  const { submitted, failed } = await proxyClient.preheatCache(requests);
+  console.log(`Preheated ${submitted} requests, ${failed} failed`);
+
+  // Register middleware (onion style: first registered runs outermost)
+  proxyClient.use(async (request, next) => {
+    console.log(`→ ${request.functionName} on chain ${request.chainId}`);
+    return next(request);
+  });
+
+  // Reset local statistics if needed (client-side metrics only)
+  proxyClient.clearCache();
+  console.log("Metrics reset");
 }
 
 export {

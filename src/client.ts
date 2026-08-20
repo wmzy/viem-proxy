@@ -6,9 +6,15 @@ import {
   createPublicClient as createViemPublicClient,
   http as viemHttp,
 } from "viem";
-import type { ProxyPublicClient, ProxyConfig, RpcRequest, RpcResponse, PerformanceMetrics } from "./types";
+import type { ProxyPublicClient, ProxyConfig, PerformanceMetrics, ProxyMiddleware } from "./types";
 import { proxyActions } from "./actions/proxyActions";
+import { batchClientActions } from "./actions/batch.client";
+import type { BatchRequest, BatchResult } from "./actions/batch.client";
+import { addMiddleware } from "./actions/middleware";
+import { preheatCache as runPreheat } from "./actions/preheat.client";
+import type { PreheatRequest, PreheatResult } from "./actions/preheat.client";
 import { withProxy } from "./proxy";
+import { getMetricsCollector, resetMetrics } from "./utils/metrics";
 
 const DEFAULT_PROXY_CONFIG: ProxyConfig = {
   enabled: true,
@@ -16,6 +22,7 @@ const DEFAULT_PROXY_CONFIG: ProxyConfig = {
   timeout: 30000,
   fallback: true,
   debug: false,
+  retryOptions: { attempts: 3, delay: 500 },
 };
 
 type CreatePublicClientConfig<
@@ -68,77 +75,56 @@ export const createPublicClient = <
     transport,
   } as PublicClientConfig) as PublicClient;
 
+  const proxyEnabled =
+    finalProxyConfig.enabled && !!finalProxyConfig.endpoint;
+
+  // The client the proxy actions resolve their config from: carries the
+  // proxy config when enabled, plain (native actions) otherwise.
+  const actionClient = proxyEnabled
+    ? withProxy(baseClient, {
+        endpoint: finalProxyConfig.endpoint,
+        timeout: finalProxyConfig.timeout,
+        fallback: finalProxyConfig.fallback,
+        debug: finalProxyConfig.debug,
+        apiKey: finalProxyConfig.apiKey,
+        retryOptions: finalProxyConfig.retryOptions,
+      })
+    : baseClient;
+
   const helperMethods = {
     proxy: finalProxyConfig,
 
-    getCacheStats: async () => ({
-      hitRate: 0,
-      totalRequests: 0,
-      cacheHits: 0,
-      cacheMisses: 0,
-    }),
+    // viem's `extend` strips any extension key that exists on the core
+    // client (`batch` is a core config key), so `batch` is wired here
+    // explicitly to survive on the returned client.
+    batch: batchClientActions(actionClient),
 
-    clearCache: async () => {
+    getCacheStats: (): PerformanceMetrics =>
+      getMetricsCollector().getSnapshot(),
+
+    // Resets local metric statistics only; purging the CDN cache itself
+    // requires server-side support and will be provided in a later version.
+    clearCache: (): void => {
+      resetMetrics();
       if (finalProxyConfig.debug) {
         console.log("[viem-proxy] Cache cleared");
       }
     },
 
-    preheatCache: async (requests: RpcRequest[]): Promise<RpcResponse[]> => {
-      if (!finalProxyConfig.endpoint) {
-        return requests.map((req) => ({
-          jsonrpc: "2.0" as const,
-          id: req.id,
-          result: null,
-          error: null,
-        }));
-      }
+    preheatCache: async (
+      requests: PreheatRequest[]
+    ): Promise<PreheatResult> =>
+      runPreheat(requests, finalProxyConfig, baseClient.chain?.id ?? 1),
 
-      const headers: Record<string, string> = { "Content-Type": "application/json" };
-      if (finalProxyConfig.apiKey) {
-        headers["X-API-Key"] = finalProxyConfig.apiKey;
-      }
-
-      try {
-        const results = await Promise.allSettled(
-          requests.map((req) =>
-            fetch(`${finalProxyConfig.endpoint}/api/v1/direct/${baseClient.chain?.id ?? 1}/${req.method}`, {
-              method: "POST",
-              headers,
-              body: JSON.stringify(req),
-            }).then((r) => r.json() as Promise<RpcResponse>)
-          )
-        );
-
-        return results.map((r, i) =>
-          r.status === "fulfilled"
-            ? r.value
-            : { jsonrpc: "2.0" as const, id: requests[i].id, result: null, error: null }
-        );
-      } catch {
-        return requests.map((req) => ({
-          jsonrpc: "2.0" as const,
-          id: req.id,
-          result: null,
-          error: null,
-        }));
-      }
+    use: (middleware: ProxyMiddleware): void => {
+      addMiddleware(middleware);
     },
 
-    getMetrics: async (): Promise<PerformanceMetrics> => ({
-      totalRequests: 0,
-      cacheHitRate: 0,
-      averageResponseTime: 0,
-      errorRate: 0,
-      strategyCounts: {
-        compressed: 0,
-        "hash-reference": 0,
-        direct: 0,
-      },
-      methodStats: {},
-    }),
+    getMetrics: async (): Promise<PerformanceMetrics> =>
+      getMetricsCollector().getSnapshot(),
 
     clearMetrics: async () => {
+      resetMetrics();
       if (finalProxyConfig.debug) {
         console.log("[viem-proxy] Metrics cleared");
       }
@@ -146,19 +132,14 @@ export const createPublicClient = <
     },
   };
 
-  if (!finalProxyConfig.enabled || !finalProxyConfig.endpoint) {
-    return Object.assign(baseClient, helperMethods) as ProxyPublicClient<TTransport, TChain>;
+  if (!proxyEnabled) {
+    return Object.assign(
+      baseClient,
+      helperMethods
+    ) as ProxyPublicClient<TTransport, TChain>;
   }
 
-  const proxiedClient = withProxy(baseClient, {
-    endpoint: finalProxyConfig.endpoint,
-    timeout: finalProxyConfig.timeout,
-    fallback: finalProxyConfig.fallback,
-    debug: finalProxyConfig.debug,
-    apiKey: finalProxyConfig.apiKey,
-  });
-
-  const extendedClient = (proxiedClient as any).extend(proxyActions);
+  const extendedClient = (actionClient as any).extend(proxyActions);
 
   return Object.assign(extendedClient, helperMethods) as ProxyPublicClient<TTransport, TChain>;
 };

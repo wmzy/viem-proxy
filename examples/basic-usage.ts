@@ -69,12 +69,20 @@ async function basicExample() {
 async function extendPatternExample() {
   console.log("\n=== Extend Pattern Example ===");
 
-  // Method 2: Using viem's createPublicClient with extend pattern
+  // Method 2: attach the proxy config with withProxy, then get the actions
+  // object directly. (`client.extend(proxyActions({...}))` proxies the
+  // regular actions, but viem's extend strips the `batch` extension key at
+  // runtime and conflicts with it under strict TypeScript — so prefer this
+  // form when you need `actions.batch(...)`.)
+  const { withProxy } = await import("../src");
+
   const client = createPublicClient({
     chain: mainnet,
     transport: http("https://eth.llamarpc.com"),
-  }).extend(
-    proxyActions({
+  });
+
+  const actions = proxyActions(
+    withProxy(client, {
       endpoint: "https://your-workers-domain.workers.dev",
       fallback: true,
       debug: true,
@@ -84,12 +92,12 @@ async function extendPatternExample() {
   try {
     // Get latest block number
     console.log("Fetching latest block number...");
-    const blockNumber = await client.getBlockNumber();
+    const blockNumber = await actions.getBlockNumber();
     console.log("Latest block:", blockNumber);
 
     // Get account balance
     console.log("\nFetching account balance...");
-    const balance = await client.getBalance({
+    const balance = await actions.getBalance({
       address: "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045",
     });
     console.log("Balance:", balance, "wei");
@@ -102,31 +110,34 @@ async function extendPatternExample() {
 async function standaloneActionExample() {
   console.log("\n=== Standalone Action Example ===");
 
-  // Method 3: Import individual actions for best tree-shaking
+  // Method 3: Import individual actions for best tree-shaking.
+  // The proxy config is attached to the client via withProxy; standalone
+  // actions read it from there.
   const { getBalance, getBlockNumber } = await import("../src/actions");
+  const { withProxy } = await import("../src");
 
-  const client = createPublicClient({
-    chain: mainnet,
-    transport: http("https://eth.llamarpc.com"),
-  });
-
-  const proxyConfig = {
-    endpoint: "https://your-workers-domain.workers.dev",
-    fallback: true,
-    debug: true,
-  };
+  const client = withProxy(
+    createPublicClient({
+      chain: mainnet,
+      transport: http("https://eth.llamarpc.com"),
+    }),
+    {
+      endpoint: "https://your-workers-domain.workers.dev",
+      fallback: true,
+      debug: true,
+    }
+  );
 
   try {
     // Get latest block number
     console.log("Fetching latest block number...");
-    const blockNumber = await getBlockNumber(client, { proxy: proxyConfig });
+    const blockNumber = await getBlockNumber(client);
     console.log("Latest block:", blockNumber);
 
     // Get account balance
     console.log("\nFetching account balance...");
     const balance = await getBalance(client, {
       address: "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045",
-      proxy: proxyConfig,
     });
     console.log("Balance:", balance, "wei");
   } catch (error) {
@@ -168,9 +179,9 @@ async function cacheExample() {
   );
 }
 
-// Proxy methods example
-async function proxyMethodsExample() {
-  console.log("\n=== Proxy Methods Example ===");
+// Metrics example - client-side performance metrics
+async function metricsExample() {
+  console.log("\n=== Metrics Example ===");
 
   const { createPublicClient: createProxyClient } = await import("../src");
 
@@ -182,21 +193,106 @@ async function proxyMethodsExample() {
     },
   });
 
-  // Get cache stats
-  const stats = await client.getCacheStats?.();
-  console.log("Cache stats:", stats);
+  // Generate some traffic so the snapshot has samples
+  await client.getBlockNumber();
+  await client.getBalance({
+    address: "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045",
+  });
 
-  // Get metrics
-  const metrics = await client.getMetrics?.();
-  console.log("Metrics:", metrics);
+  // Synchronous snapshot: request counts, cache hit rate, error rate,
+  // P50/P95/P99 response times, with a per-method breakdown
+  const stats = client.getCacheStats();
+  console.log(`Total requests: ${stats.totalRequests}`);
+  console.log(`Cache hit rate: ${(stats.cacheHitRate * 100).toFixed(1)}%`);
+  console.log(`P95 response time: ${stats.responseTimeP95}ms`);
+  console.log("Per-method stats:", stats.methodStats);
 
-  // Clear cache
-  await client.clearCache?.();
-  console.log("Cache cleared");
+  // Reset the locally collected metrics (client-side statistics only)
+  client.clearCache();
+  console.log("Metrics reset");
+}
 
-  // Clear metrics
-  await client.clearMetrics?.();
-  console.log("Metrics cleared");
+// Batch example - multiple actions in one round trip (POST /api/v1/batch)
+async function batchExample() {
+  console.log("\n=== Batch Example ===");
+
+  const { createPublicClient: createProxyClient } = await import("../src");
+
+  const client = createProxyClient({
+    chain: mainnet,
+    proxy: {
+      enabled: true,
+      endpoint: "https://your-workers-domain.workers.dev",
+    },
+  });
+
+  // Per-item isolation: a failing item yields an `error` entry,
+  // the rest still resolve; `chainId` overrides the target chain per item
+  const results = await client.batch([
+    { id: 1, action: "getBalance", args: { address: "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045" } },
+    { id: 2, action: "getBlockNumber" },
+    { id: 3, action: "getGasPrice", chainId: 137 },
+  ]);
+
+  for (const item of results) {
+    if (item.error) {
+      console.error(`#${item.id} failed:`, item.error.message);
+    } else {
+      console.log(`#${item.id}:`, item.result);
+    }
+  }
+}
+
+// Preheat example - fill the CDN cache ahead of real traffic
+async function preheatExample() {
+  console.log("\n=== Preheat Example ===");
+
+  const { createPublicClient: createProxyClient } = await import("../src");
+
+  const client = createProxyClient({
+    chain: mainnet,
+    proxy: {
+      enabled: true,
+      endpoint: "https://your-workers-domain.workers.dev",
+    },
+  });
+
+  // Each item goes through the regular compressed GET path in a bounded
+  // pool (5 concurrent). Never throws: failures are counted instead.
+  const { submitted, failed } = await client.preheatCache([
+    { action: "getBalance", args: { address: "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045" } },
+    { action: "getBlockNumber" },
+    { action: "getGasPrice" },
+  ]);
+  console.log(`Preheated ${submitted} requests, ${failed} failed`);
+}
+
+// Middleware example - onion-style request instrumentation
+async function middlewareExample() {
+  console.log("\n=== Middleware Example ===");
+
+  const { createPublicClient: createProxyClient } = await import("../src");
+
+  const client = createProxyClient({
+    chain: mainnet,
+    proxy: {
+      enabled: true,
+      endpoint: "https://your-workers-domain.workers.dev",
+    },
+  });
+
+  // The first registered middleware runs outermost; a middleware that
+  // throws aborts the request (which then follows the fallback/error path)
+  client.use(async (request, next) => {
+    const start = Date.now();
+    const response = await next(request);
+    console.log(
+      `${request.functionName}(chain ${request.chainId}) took ${Date.now() - start}ms`
+    );
+    return response;
+  });
+
+  await client.getBlockNumber();
 }
 
 // Run examples
@@ -205,7 +301,10 @@ async function runExamples() {
   await extendPatternExample();
   await standaloneActionExample();
   await cacheExample();
-  await proxyMethodsExample();
+  await metricsExample();
+  await batchExample();
+  await preheatExample();
+  await middlewareExample();
 }
 
 runExamples().catch(console.error);
@@ -215,5 +314,8 @@ export {
   extendPatternExample,
   standaloneActionExample,
   cacheExample,
-  proxyMethodsExample,
+  metricsExample,
+  batchExample,
+  preheatExample,
+  middlewareExample,
 };

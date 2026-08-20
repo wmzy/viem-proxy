@@ -12,8 +12,11 @@ import type {
 import { decompressParams, generateParamHash } from "../utils/compression";
 import {
   getCacheStrategy,
+  resolveTraceId,
   setCacheHeaders,
 } from "../utils/cache";
+import { recordRequestStats } from "../utils/statistics";
+import type { CacheStatus } from "../types";
 import { getRpcUrls, executeRpcCall as sharedExecuteRpcCall } from "../actions/utils";
 
 const getProxyState = (c: Context<{ Bindings: Env }>, chainId: number) => {
@@ -36,7 +39,7 @@ const generateRequestHash = async (
 const executeWithDeduplication = async (
   c: Context<{ Bindings: Env }>,
   requestInfo: RequestInfo
-): Promise<{ result: unknown; blockNumber?: string }> => {
+): Promise<{ result: unknown; blockNumber?: string; cacheStatus: CacheStatus }> => {
   const proxyState = getProxyState(c, requestInfo.chainId);
   const requestHash = await generateRequestHash(
     requestInfo.chainId,
@@ -60,9 +63,23 @@ const executeWithDeduplication = async (
   // If request exists and is completed, return cached result
   if (checkResult.exists && checkResult.request) {
     if (checkResult.request.status === "completed" && checkResult.request.result) {
-      return JSON.parse(checkResult.request.result);
+      recordRequestStats(c, {
+        method: requestInfo.method,
+        chainId: requestInfo.chainId,
+        cacheStatus: "HIT",
+        error: false,
+        durationMs: 0,
+      });
+      return { ...JSON.parse(checkResult.request.result), cacheStatus: "HIT" };
     }
     if (checkResult.request.status === "failed" && checkResult.request.error) {
+      recordRequestStats(c, {
+        method: requestInfo.method,
+        chainId: requestInfo.chainId,
+        cacheStatus: "HIT",
+        error: true,
+        durationMs: 0,
+      });
       throw new Error(checkResult.request.error);
     }
     if (checkResult.request.status === "pending") {
@@ -88,13 +105,28 @@ const executeWithDeduplication = async (
           throw new Error(status.error);
         }
       }
+      recordRequestStats(c, {
+        method: requestInfo.method,
+        chainId: requestInfo.chainId,
+        cacheStatus: "HIT",
+        error: true,
+        durationMs: 0,
+      });
       throw new Error("Request timeout");
     }
   }
 
   // Execute the RPC call
+  const upstreamStart = Date.now();
   try {
     const result = await executeRpcCall(requestInfo, c.env);
+    recordRequestStats(c, {
+      method: requestInfo.method,
+      chainId: requestInfo.chainId,
+      cacheStatus: "MISS",
+      error: false,
+      durationMs: Date.now() - upstreamStart,
+    });
 
     // Mark request as completed
     await proxyState.fetch(
@@ -104,8 +136,15 @@ const executeWithDeduplication = async (
       })
     );
 
-    return result;
+    return { ...result, cacheStatus: "MISS" };
   } catch (error) {
+    recordRequestStats(c, {
+      method: requestInfo.method,
+      chainId: requestInfo.chainId,
+      cacheStatus: "MISS",
+      error: true,
+      durationMs: Date.now() - upstreamStart,
+    });
     // Mark request as failed
     await proxyState.fetch(
       new Request(`http://do/requests/${requestHash}/fail`, {
@@ -149,6 +188,7 @@ export const handleCompressedRequest = async (
     };
 
     // Execute RPC call with deduplication
+    const traceId = resolveTraceId(c.req.header("X-Trace-Id"));
     const result = await executeWithDeduplication(c, requestInfo);
 
     // Set cache strategy
@@ -166,7 +206,10 @@ export const handleCompressedRequest = async (
       timestamp: Date.now(),
     });
 
-    return setCacheHeaders(response, cacheStrategy.ttl);
+    return setCacheHeaders(response, cacheStrategy.ttl, {
+      cacheStatus: result.cacheStatus,
+      traceId,
+    });
   } catch (error) {
     console.error("Compressed request error:", error);
     const isDebug = c.env.ENVIRONMENT !== "production";
@@ -235,6 +278,7 @@ export const handleHashReferenceRequest = async (
           strategy: "hash-reference",
         };
 
+        const traceId = resolveTraceId(c.req.header("X-Trace-Id"));
         const result = await executeWithDeduplication(c, requestInfo);
         const cacheStrategy = getCacheStrategy(chainId, method, params);
 
@@ -244,7 +288,10 @@ export const handleHashReferenceRequest = async (
           timestamp: Date.now(),
         });
 
-        return setCacheHeaders(response, cacheStrategy.ttl);
+        return setCacheHeaders(response, cacheStrategy.ttl, {
+          cacheStatus: result.cacheStatus,
+          traceId,
+        });
       }
 
       return c.json(
@@ -262,6 +309,7 @@ export const handleHashReferenceRequest = async (
       strategy: "hash-reference",
     };
 
+    const traceId = resolveTraceId(c.req.header("X-Trace-Id"));
     const result = await executeWithDeduplication(c, requestInfo);
     const cacheStrategy = getCacheStrategy(chainId, method, params);
 
@@ -271,7 +319,10 @@ export const handleHashReferenceRequest = async (
       timestamp: Date.now(),
     });
 
-    return setCacheHeaders(response, cacheStrategy.ttl);
+    return setCacheHeaders(response, cacheStrategy.ttl, {
+      cacheStatus: result.cacheStatus,
+      traceId,
+    });
   } catch (error) {
     console.error("Hash reference request error:", error);
     const isDebug = c.env.ENVIRONMENT !== "production";
@@ -349,14 +400,37 @@ export const handleDirectRequest = async (c: Context<{ Bindings: Env }>) => {
       strategy: "direct",
     };
 
-    const result = await executeRpcCall(requestInfo, c.env);
+    const traceId = resolveTraceId(c.req.header("X-Trace-Id"));
+    const upstreamStart = Date.now();
+    let result: { result: unknown; blockNumber?: string };
+    try {
+      result = await executeRpcCall(requestInfo, c.env);
+      recordRequestStats(c, {
+        method,
+        chainId: requestInfo.chainId,
+        cacheStatus: "MISS",
+        error: false,
+        durationMs: Date.now() - upstreamStart,
+      });
+    } catch (error) {
+      recordRequestStats(c, {
+        method,
+        chainId: requestInfo.chainId,
+        cacheStatus: "MISS",
+        error: true,
+        durationMs: Date.now() - upstreamStart,
+      });
+      throw error;
+    }
 
-    // Direct requests don't set cache
-    return c.json({
+    // Direct requests bypass the cache but still carry observability headers
+    const response = c.json({
       result: result.result,
       blockNumber: result.blockNumber,
       timestamp: Date.now(),
     });
+
+    return setCacheHeaders(response, 0, { cacheStatus: "MISS", traceId });
   } catch (error) {
     console.error("Direct request error:", error);
     const isDebug = c.env.ENVIRONMENT !== "production";
@@ -391,6 +465,7 @@ export const handleFunctionRequest = async (c: Context<{ Bindings: Env }>) => {
       strategy: "function",
     };
 
+    const traceId = resolveTraceId(c.req.header("X-Trace-Id"));
     const result = await executeWithDeduplication(c, requestInfo);
     const cacheStrategy = getCacheStrategy(
       requestInfo.chainId,
@@ -406,7 +481,10 @@ export const handleFunctionRequest = async (c: Context<{ Bindings: Env }>) => {
       timestamp: Date.now(),
     });
 
-    return setCacheHeaders(response, cacheStrategy.ttl);
+    return setCacheHeaders(response, cacheStrategy.ttl, {
+      cacheStatus: result.cacheStatus,
+      traceId,
+    });
   } catch (error) {
     console.error("Function request error:", error);
     const isDebug = c.env.ENVIRONMENT !== "production";

@@ -88,9 +88,9 @@ Client → Proxy Action (*.client.ts) → Workers API → Action Handler (*.serv
 ```
 
 ### Usage Patterns
-1. **createPublicClient with proxy config**: Simple drop-in replacement
-2. **client.extend(proxyActions())**: Recommended for tree-shaking
-3. **Standalone action import**: Best tree-shaking, import only what you need
+1. **createPublicClient with proxy config**: Simple drop-in replacement; helper methods (`batch`, `getCacheStats`, `clearCache`, `preheatCache`, `use`) wired directly
+2. **client.extend(proxyActions())**: Recommended for tree-shaking. Caveat: viem's `extend` both type-rejects and runtime-strips the `batch` extension key (collides with viem's `batch` multicall config), so use `proxyActions(client).batch(...)` or `batchActions(requests, config)` for batching
+3. **Standalone action import**: Best tree-shaking, import only what you need; attach the config with `withProxy(client, config)`
 
 ### Supported Methods (by Priority)
 
@@ -107,12 +107,20 @@ Client → Proxy Action (*.client.ts) → Workers API → Action Handler (*.serv
 - `getLogs` - Log queries
 - `getCode` - Contract code queries
 
+**P2 (Additional Actions)**:
+- `getChainId` - Chain ID queries
+- `getTransactionCount` - Transaction count (nonce) queries
+- `getStorageAt` - Storage slot queries
+- `getFeeHistory` - Historical gas fee queries
+- `getBlobBaseFee` - Blob base fee queries
+
 ### Smart Caching
-- **Historical data** (finalized blocks): Cache 30 days
-- **Recent data** (within epoch): Cache 5 minutes
-- **Latest data** (latest/pending): Cache 12 seconds
-- **Account state**: Cache 30 seconds
-- **Transaction data**: Cache 1 year
+TTLs are defined in `workers/src/utils/cache.ts` (`getCacheTtlByMethod`):
+- **Historical tx data** (`eth_getBlockByHash`, `eth_getTransactionByHash`, `eth_getTransactionReceipt`): 1 year
+- **Block-scoped queries** (`eth_getBlockByNumber`, `eth_getStorageAt`), by block param: finalized → 30 days; ≥ 2 epochs → 1 day; ≥ 1 epoch → 1 hour; newer → 5 minutes; `latest`/`pending` → 12s
+- **Latest data** (`eth_blockNumber`, `eth_gasPrice`, `eth_estimateGas`, `eth_feeHistory`, `eth_blobBaseFee`): 12 seconds
+- **Account state** (`eth_getBalance`, `eth_call`, `eth_getTransactionCount`): 30 seconds
+- **Contract code** (`eth_getCode`): 5 minutes; **network info** (`eth_chainId`, `net_version`, `web3_clientVersion`): 1 hour; **logs** (`eth_getLogs`): 1 minute; default: 5 minutes
 
 ### Request Deduplication
 Durable Objects provide single-threaded execution to deduplicate concurrent identical requests:

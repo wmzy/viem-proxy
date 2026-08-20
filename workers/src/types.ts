@@ -1,7 +1,9 @@
 import type { ProxyState } from "./durable-objects/proxy-state";
+import type { Statistics } from "./durable-objects/statistics";
 
 export type Env = {
   PROXY_STATE: DurableObjectNamespace<ProxyState>;
+  STATISTICS: DurableObjectNamespace<Statistics>;
   ENVIRONMENT: string;
   MAX_CACHE_TTL: string;
   DEFAULT_CACHE_TTL: string;
@@ -9,7 +11,17 @@ export type Env = {
   FINALIZED_BLOCK_CACHE_TTL: string;
   API_KEY?: string;
   RPC_URLS?: string;
+  /** Per-chain upstream RPC concurrency cap (default 10) */
+  MAX_RPC_CONCURRENCY?: string;
 };
+
+/**
+ * Worker-level cache serving decision, exposed via the `X-Cache` response
+ * header. "HIT" means the Worker answered from its own cache (DO
+ * deduplication store); "MISS" means an upstream RPC call was executed.
+ * CDN hits never invoke the Worker, so they are invisible here by design.
+ */
+export type CacheStatus = "HIT" | "MISS";
 
 export type RpcRequest = {
   jsonrpc: "2.0";

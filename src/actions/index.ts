@@ -10,6 +10,27 @@ export { estimateGas } from "./estimateGas.client";
 export { getGasPrice } from "./getGasPrice.client";
 export { getLogs } from "./getLogs.client";
 export { getCode } from "./getCode.client";
+export { getChainId } from "./getChainId.client";
+export { getTransactionCount } from "./getTransactionCount.client";
+export { getStorageAt } from "./getStorageAt.client";
+export { getFeeHistory } from "./getFeeHistory.client";
+export { getBlobBaseFee } from "./getBlobBaseFee.client";
+
+// Batch API
+export { batchActions, runNativeBatch } from "./batch.client";
+export type {
+  BatchActionName,
+  BatchRequest,
+  BatchResult,
+  BatchItemError,
+} from "./batch.client";
+
+// Cache preheat API
+export { preheatCache, preheatClientCache, PREHEAT_CONCURRENCY } from "./preheat.client";
+export type { PreheatRequest, PreheatResult } from "./preheat.client";
+
+// Middleware API
+export { addMiddleware, clearMiddlewares, getMiddlewares } from "./middleware";
 
 // Extend helper
 export { proxyActions } from "./proxyActions";
@@ -30,3 +51,8 @@ export type { EstimateGasParameters, EstimateGasReturnType } from "./estimateGas
 export type { GetGasPriceReturnType } from "./getGasPrice.client";
 export type { GetLogsParameters, GetLogsReturnType } from "./getLogs.client";
 export type { GetCodeParameters, GetCodeReturnType } from "./getCode.client";
+export type { GetChainIdReturnType } from "./getChainId.client";
+export type { GetTransactionCountParameters, GetTransactionCountReturnType } from "./getTransactionCount.client";
+export type { GetStorageAtParameters, GetStorageAtReturnType } from "./getStorageAt.client";
+export type { GetFeeHistoryParameters, GetFeeHistoryReturnType } from "./getFeeHistory.client";
+export type { GetBlobBaseFeeReturnType } from "./getBlobBaseFee.client";

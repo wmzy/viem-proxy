@@ -10,6 +10,11 @@ export { estimateGasHandler } from "./estimateGas.server";
 export { getGasPriceHandler } from "./getGasPrice.server";
 export { getLogsHandler } from "./getLogs.server";
 export { getCodeHandler } from "./getCode.server";
+export { getChainIdHandler } from "./getChainId.server";
+export { getTransactionCountHandler } from "./getTransactionCount.server";
+export { getStorageAtHandler } from "./getStorageAt.server";
+export { getFeeHistoryHandler } from "./getFeeHistory.server";
+export { getBlobBaseFeeHandler } from "./getBlobBaseFee.server";
 
 // Types
 export type {
@@ -32,6 +37,11 @@ import { estimateGasHandler } from "./estimateGas.server";
 import { getGasPriceHandler } from "./getGasPrice.server";
 import { getLogsHandler } from "./getLogs.server";
 import { getCodeHandler } from "./getCode.server";
+import { getChainIdHandler } from "./getChainId.server";
+import { getTransactionCountHandler } from "./getTransactionCount.server";
+import { getStorageAtHandler } from "./getStorageAt.server";
+import { getFeeHistoryHandler } from "./getFeeHistory.server";
+import { getBlobBaseFeeHandler } from "./getBlobBaseFee.server";
 
 // Action registry for dynamic dispatch
 export const actionHandlers = {
@@ -46,6 +56,11 @@ export const actionHandlers = {
   getGasPrice: getGasPriceHandler,
   getLogs: getLogsHandler,
   getCode: getCodeHandler,
+  getChainId: getChainIdHandler,
+  getTransactionCount: getTransactionCountHandler,
+  getStorageAt: getStorageAtHandler,
+  getFeeHistory: getFeeHistoryHandler,
+  getBlobBaseFee: getBlobBaseFeeHandler,
 } as const;
 
 export type ActionName = keyof typeof actionHandlers;

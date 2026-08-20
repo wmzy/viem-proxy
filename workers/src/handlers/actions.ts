@@ -1,7 +1,8 @@
 import { type Context } from "hono";
-import type { Env } from "../types";
+import type { CacheStatus, Env } from "../types";
 import { actionHandlers, type ActionName, type ActionContext } from "../actions";
-import { getCacheStrategy, setCacheHeaders } from "../utils/cache";
+import { getCacheStrategy, resolveTraceId, setCacheHeaders } from "../utils/cache";
+import { recordRequestStats } from "../utils/statistics";
 import { generateParamHash } from "../utils/compression";
 
 const ACTION_TO_RPC_METHOD: Record<string, string> = {
@@ -16,6 +17,11 @@ const ACTION_TO_RPC_METHOD: Record<string, string> = {
   getGasPrice: "eth_gasPrice",
   getLogs: "eth_getLogs",
   getCode: "eth_getCode",
+  getChainId: "eth_chainId",
+  getTransactionCount: "eth_getTransactionCount",
+  getStorageAt: "eth_getStorageAt",
+  getFeeHistory: "eth_feeHistory",
+  getBlobBaseFee: "eth_blobBaseFee",
 };
 
 const getProxyState = (c: Context<{ Bindings: Env }>, chainId: number) => {
@@ -34,13 +40,16 @@ const generateRequestHash = async (
 
 /**
  * Execute action with deduplication
+ *
+ * Shared by the single-action route and the batch endpoint: performs DO
+ * request deduplication, invokes the action handler, and records stats.
  */
-const executeWithDeduplication = async <T>(
+export const executeWithDeduplication = async <T>(
   c: Context<{ Bindings: Env }>,
   chainId: number,
   actionName: ActionName,
   args: Record<string, unknown>
-): Promise<{ result: T; blockNumber?: string }> => {
+): Promise<{ result: T; blockNumber?: string; cacheStatus: CacheStatus }> => {
   const proxyState = getProxyState(c, chainId);
   const requestHash = await generateRequestHash(chainId, actionName, args);
 
@@ -58,9 +67,23 @@ const executeWithDeduplication = async <T>(
 
   if (checkResult.exists && checkResult.request) {
     if (checkResult.request.status === "completed" && checkResult.request.result) {
-      return JSON.parse(checkResult.request.result);
+      recordRequestStats(c, {
+        method: ACTION_TO_RPC_METHOD[actionName] ?? actionName,
+        chainId,
+        cacheStatus: "HIT",
+        error: false,
+        durationMs: 0,
+      });
+      return { ...JSON.parse(checkResult.request.result), cacheStatus: "HIT" };
     }
     if (checkResult.request.status === "failed" && checkResult.request.error) {
+      recordRequestStats(c, {
+        method: ACTION_TO_RPC_METHOD[actionName] ?? actionName,
+        chainId,
+        cacheStatus: "HIT",
+        error: true,
+        durationMs: 0,
+      });
       throw new Error(checkResult.request.error);
     }
     if (checkResult.request.status === "pending") {
@@ -86,10 +109,18 @@ const executeWithDeduplication = async <T>(
           throw new Error(status.error);
         }
       }
+      recordRequestStats(c, {
+        method: ACTION_TO_RPC_METHOD[actionName] ?? actionName,
+        chainId,
+        cacheStatus: "HIT",
+        error: true,
+        durationMs: 0,
+      });
       throw new Error("Request timeout");
     }
   }
 
+  const upstreamStart = Date.now();
   try {
     const handler = actionHandlers[actionName];
     const ctx: ActionContext = {
@@ -99,6 +130,13 @@ const executeWithDeduplication = async <T>(
     };
 
     const result = await handler(ctx as any);
+    recordRequestStats(c, {
+      method: ACTION_TO_RPC_METHOD[actionName] ?? actionName,
+      chainId,
+      cacheStatus: "MISS",
+      error: false,
+      durationMs: Date.now() - upstreamStart,
+    });
 
     await proxyState.fetch(
       new Request(`http://do/requests/${requestHash}/complete`, {
@@ -107,8 +145,19 @@ const executeWithDeduplication = async <T>(
       })
     );
 
-    return result as { result: T; blockNumber?: string };
+    return { ...result, cacheStatus: "MISS" } as {
+      result: T;
+      blockNumber?: string;
+      cacheStatus: CacheStatus;
+    };
   } catch (error) {
+    recordRequestStats(c, {
+      method: ACTION_TO_RPC_METHOD[actionName] ?? actionName,
+      chainId,
+      cacheStatus: "MISS",
+      error: true,
+      durationMs: Date.now() - upstreamStart,
+    });
     await proxyState.fetch(
       new Request(`http://do/requests/${requestHash}/fail`, {
         method: "PUT",
@@ -143,6 +192,7 @@ export const handleActionRequest = async (c: Context<{ Bindings: Env }>) => {
     }
 
     const chainIdNum = parseInt(chainId);
+    const traceId = resolveTraceId(c.req.header("X-Trace-Id"));
     const result = await executeWithDeduplication(
       c,
       chainIdNum,
@@ -165,7 +215,10 @@ export const handleActionRequest = async (c: Context<{ Bindings: Env }>) => {
       timestamp: Date.now(),
     });
 
-    return setCacheHeaders(response, cacheStrategy.ttl);
+    return setCacheHeaders(response, cacheStrategy.ttl, {
+      cacheStatus: result.cacheStatus,
+      traceId,
+    });
   } catch (error) {
     console.error("Action request error:", error);
     const isDebug = c.env.ENVIRONMENT !== "production";
