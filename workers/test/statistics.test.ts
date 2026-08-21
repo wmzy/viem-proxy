@@ -8,6 +8,7 @@
  * the Mock Environment block there.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { createRequire } from "node:module";
 
 // The DurableObject base class only exists in the Workers runtime;
 // substitute a plain class so the DO can be constructed under Node.
@@ -36,6 +37,7 @@ import {
 } from "../src/utils/statistics";
 import type { Env as WorkerEnv } from "../src/types";
 import { Statistics } from "../src/durable-objects/statistics";
+import { ProxyState } from "../src/durable-objects/proxy-state";
 import { getMaxRpcConcurrency, setMaxRpcConcurrency } from "../src/actions/utils";
 import app from "../src/index";
 
@@ -1078,5 +1080,350 @@ describe("Response observability headers", () => {
     expect(response.headers.get("X-Cache")).toBe("MISS");
     expect(response.headers.get("X-Trace-Id")).toMatch(/^[0-9a-f]{12}$/);
     spy.mockRestore();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ProxyState Durable Object: stale dedup records must not poison reads
+// ---------------------------------------------------------------------------
+
+const RESULT_TTL_MS = 30 * 1000;
+const PENDING_TTL_MS = 5 * 60 * 1000;
+
+type SqliteDatabase = {
+  prepare: (sql: string) => {
+    all: (...params: unknown[]) => Record<string, unknown>[];
+    run: (...params: unknown[]) => unknown;
+  };
+};
+
+// node:sqlite is newer than Vite's builtin list, so resolve it at runtime
+// instead of via a static import. Backs the ProxyState DO harness with real
+// SQLite so the actual SQL freshness filtering is exercised (not a fake).
+let databaseSyncCtor: new (path: string) => SqliteDatabase | null = null;
+const getDatabaseSync = () => {
+  if (!databaseSyncCtor) {
+    databaseSyncCtor = createRequire(import.meta.url)("node:sqlite").DatabaseSync;
+  }
+  return databaseSyncCtor;
+};
+
+/**
+ * Build a real ProxyState instance backed by an in-memory SQLite database.
+ */
+const createProxyStateDo = () => {
+  const db = new (getDatabaseSync())(":memory:");
+  let alarm: number | null = null;
+  const storage = {
+    sql: {
+      exec: (sql: string, ...params: unknown[]) =>
+        db.prepare(sql).all(...params) as Record<string, unknown>[],
+    },
+    getAlarm: async () => alarm,
+    setAlarm: async (time: number) => {
+      alarm = time;
+    },
+  };
+  const instance = new ProxyState({ storage } as never, {} as never);
+  return { instance, db };
+};
+
+const seedPendingRow = (
+  db: SqliteDatabase,
+  row: {
+    request_hash: string;
+    status: "pending" | "completed" | "failed";
+    result?: string | null;
+    error?: string | null;
+    created_at: number;
+    completed_at?: number | null;
+  }
+) => {
+  db.prepare(
+    `INSERT INTO pending_requests
+       (request_hash, status, result, error, created_at, completed_at)
+     VALUES (?, ?, ?, ?, ?, ?)`
+  ).run(
+    row.request_hash,
+    row.status,
+    row.result ?? null,
+    row.error ?? null,
+    row.created_at,
+    row.completed_at ?? null
+  );
+};
+
+const checkRequest = (instance: ProxyState, requestHash: string) =>
+  instance
+    .fetch(
+      new Request("http://do/requests", {
+        method: "POST",
+        body: JSON.stringify({ requestHash }),
+      })
+    )
+    .then(
+      (r) =>
+        r.json() as Promise<{
+          exists: boolean;
+          created?: boolean;
+          request?: { status: string };
+        }>
+    );
+
+describe("ProxyState Durable Object freshness", () => {
+  it("should treat a completed record older than the result TTL as nonexistent", async () => {
+    const { instance, db } = createProxyStateDo();
+    // Trigger schema initialization
+    await instance.fetch(new Request("http://do/requests/init/status"));
+
+    const now = Date.now();
+    seedPendingRow(db, {
+      request_hash: "stale-completed",
+      status: "completed",
+      result: JSON.stringify({ result: "0xstale" }),
+      created_at: now - 2 * RESULT_TTL_MS,
+      completed_at: now - RESULT_TTL_MS - 1000,
+    });
+
+    const body = await checkRequest(instance, "stale-completed");
+    expect(body.exists).toBe(false);
+    expect(body.created).toBe(true);
+
+    // The stale row must be replaced by a fresh pending record so the hash
+    // is deduplicated again instead of staying poisoned until cleanup runs
+    const rows = db
+      .prepare(
+        `SELECT status, created_at FROM pending_requests WHERE request_hash = ?`
+      )
+      .all("stale-completed") as Array<{ status: string; created_at: number }>;
+    expect(rows).toHaveLength(1);
+    expect(rows[0].status).toBe("pending");
+    expect(rows[0].created_at).toBeGreaterThanOrEqual(now);
+  });
+
+  it("should treat a failed record older than the result TTL as nonexistent", async () => {
+    const { instance, db } = createProxyStateDo();
+    await instance.fetch(new Request("http://do/requests/init/status"));
+
+    const now = Date.now();
+    seedPendingRow(db, {
+      request_hash: "stale-failed",
+      status: "failed",
+      error: "429 Too Many Requests",
+      created_at: now - 2 * RESULT_TTL_MS,
+      completed_at: now - RESULT_TTL_MS - 1000,
+    });
+
+    const body = await checkRequest(instance, "stale-failed");
+    expect(body.exists).toBe(false);
+    expect(body.created).toBe(true);
+  });
+
+  it("should treat a pending record older than the pending TTL as nonexistent", async () => {
+    const { instance, db } = createProxyStateDo();
+    await instance.fetch(new Request("http://do/requests/init/status"));
+
+    const now = Date.now();
+    seedPendingRow(db, {
+      request_hash: "stale-pending",
+      status: "pending",
+      created_at: now - PENDING_TTL_MS - 1000,
+      completed_at: null,
+    });
+
+    const body = await checkRequest(instance, "stale-pending");
+    expect(body.exists).toBe(false);
+    expect(body.created).toBe(true);
+  });
+
+  it("should still return fresh completed and failed records", async () => {
+    const { instance, db } = createProxyStateDo();
+    await instance.fetch(new Request("http://do/requests/init/status"));
+
+    const now = Date.now();
+    seedPendingRow(db, {
+      request_hash: "fresh-completed",
+      status: "completed",
+      result: JSON.stringify({ result: "0xfresh" }),
+      created_at: now - 1000,
+      completed_at: now - 500,
+    });
+    seedPendingRow(db, {
+      request_hash: "fresh-failed",
+      status: "failed",
+      error: "boom",
+      created_at: now - 1000,
+      completed_at: now - 500,
+    });
+
+    const completed = await checkRequest(instance, "fresh-completed");
+    expect(completed.exists).toBe(true);
+    expect(completed.request?.status).toBe("completed");
+
+    const failed = await checkRequest(instance, "fresh-failed");
+    expect(failed.exists).toBe(true);
+    expect(failed.request?.status).toBe("failed");
+  });
+
+  it("should still return a fresh pending record", async () => {
+    const { instance, db } = createProxyStateDo();
+    await instance.fetch(new Request("http://do/requests/init/status"));
+
+    seedPendingRow(db, {
+      request_hash: "fresh-pending",
+      status: "pending",
+      created_at: Date.now() - 1000,
+      completed_at: null,
+    });
+
+    const body = await checkRequest(instance, "fresh-pending");
+    expect(body.exists).toBe(true);
+    expect(body.request?.status).toBe("pending");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Deduplication polling path (pending → completed/failed)
+// ---------------------------------------------------------------------------
+
+type PollOutcome =
+  | { status: "pending" }
+  | { status: "completed"; result: string }
+  | { status: "failed"; error: string };
+
+/**
+ * ProxyState namespace mock that reports an existing pending request and
+ * replays the given outcomes over subsequent status polls.
+ */
+const createPollingProxyStateNamespace = (outcomes: PollOutcome[]) => {
+  let polls = 0;
+  return {
+    idFromName: (name: string) => ({ name }),
+    get: () => ({
+      fetch: async (request: Request): Promise<Response> => {
+        const url = new URL(request.url);
+        if (request.method === "POST" && url.pathname === "/requests") {
+          return Response.json({
+            exists: true,
+            request: { status: "pending" },
+          });
+        }
+        if (request.method === "GET" && url.pathname.includes("/status")) {
+          const outcome = outcomes[Math.min(polls, outcomes.length - 1)];
+          polls += 1;
+          if (outcome.status === "completed") {
+            return Response.json({ status: "completed", result: outcome.result });
+          }
+          if (outcome.status === "failed") {
+            return Response.json({ status: "failed", error: outcome.error });
+          }
+          return Response.json({ status: "pending" });
+        }
+        return new Response(JSON.stringify({ error: "Not found" }), { status: 404 });
+      },
+    }),
+  };
+};
+
+describe("Deduplication polling path", () => {
+  it("should record a HIT and set X-Cache when a polled request completes", async () => {
+    const proxyState = createPollingProxyStateNamespace([
+      { status: "pending" },
+      {
+        status: "completed",
+        result: JSON.stringify({ result: "0xpolled", blockNumber: "0x5" }),
+      },
+    ]);
+    const statistics = createStatisticsHarness();
+
+    const params = `u:${encodeURIComponent('["0x123","latest"]')}`;
+    const response = await app.request(
+      `/api/v1/1/eth_getBalance?p=${encodeURIComponent(params)}`,
+      undefined,
+      {
+        ...baseEnv,
+        PROXY_STATE: proxyState,
+        STATISTICS: statistics.namespace,
+      } as unknown as WorkerEnv
+    );
+
+    expect(response.status).toBe(200);
+    expect((await response.json()).result).toBe("0xpolled");
+    expect(response.headers.get("X-Cache")).toBe("HIT");
+    expect(mockFetch).not.toHaveBeenCalled();
+    expect(statistics.records).toHaveLength(1);
+    expect(statistics.records[0]).toMatchObject({
+      method: "eth_getBalance",
+      chainId: 1,
+      cacheStatus: "HIT",
+      error: false,
+    });
+  });
+
+  it("should record an error HIT when a polled request fails", async () => {
+    const proxyState = createPollingProxyStateNamespace([
+      { status: "failed", error: "upstream 429" },
+    ]);
+    const statistics = createStatisticsHarness();
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const params = `u:${encodeURIComponent('["0x123","latest"]')}`;
+    const response = await app.request(
+      `/api/v1/1/eth_getBalance?p=${encodeURIComponent(params)}`,
+      undefined,
+      {
+        ...baseEnv,
+        PROXY_STATE: proxyState,
+        STATISTICS: statistics.namespace,
+      } as unknown as WorkerEnv
+    );
+
+    expect(response.status).toBe(500);
+    expect(mockFetch).not.toHaveBeenCalled();
+    expect(statistics.records).toHaveLength(1);
+    expect(statistics.records[0]).toMatchObject({
+      method: "eth_getBalance",
+      chainId: 1,
+      cacheStatus: "HIT",
+      error: true,
+    });
+    spy.mockRestore();
+  });
+
+  it("should record a HIT when a polled action request completes", async () => {
+    const proxyState = createPollingProxyStateNamespace([
+      {
+        status: "completed",
+        result: JSON.stringify({ result: "0xaction-polled" }),
+      },
+    ]);
+    const statistics = createStatisticsHarness();
+
+    const response = await app.request(
+      "/api/v1/1/getBalance",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          address: "0x742d35Cc6634C0532925a3b844Bc9e7595f2bD18",
+        }),
+      },
+      {
+        ...baseEnv,
+        PROXY_STATE: proxyState,
+        STATISTICS: statistics.namespace,
+      } as unknown as WorkerEnv
+    );
+
+    expect(response.status).toBe(200);
+    expect((await response.json()).result).toBe("0xaction-polled");
+    expect(response.headers.get("X-Cache")).toBe("HIT");
+    expect(mockFetch).not.toHaveBeenCalled();
+    expect(statistics.records).toHaveLength(1);
+    expect(statistics.records[0]).toMatchObject({
+      method: "eth_getBalance",
+      chainId: 1,
+      cacheStatus: "HIT",
+      error: false,
+    });
   });
 });

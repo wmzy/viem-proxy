@@ -1,6 +1,5 @@
 # viem-proxy
 
-[![npm version](https://badge.fury.io/js/viem-proxy.svg)](https://badge.fury.io/js/viem-proxy)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 高性能的 Web3 RPC 缓存代理库，通过 Cloudflare CDN 优化区块链数据读取性能。
@@ -169,7 +168,7 @@ const client = createPublicClient({
 ### 1. 克隆项目
 
 ```bash
-git clone https://github.com/your-username/viem-proxy.git
+git clone https://github.com/wmzy/viem-proxy.git
 cd viem-proxy/workers
 ```
 
@@ -228,14 +227,10 @@ pnpm run deploy
 type ProxyConfig = {
   enabled: boolean              // 是否启用代理
   endpoint: string             // Workers 端点
-  endpoints?: string[]         // Workers 端点列表（负载均衡）
   timeout?: number             // 请求超时时间(ms)，默认 30000
   fallback?: boolean           // 是否启用回退，默认 true
   debug?: boolean              // 调试模式
   apiKey?: string              // API 认证密钥（对应 Workers 的 API_KEY）
-  cacheControl?: {             // 自定义缓存策略（method → 秒）
-    [method: string]: number
-  }
   retryOptions?: {             // 瞬时失败重试策略
     attempts: number           // 总尝试次数（含首次请求），默认 3
     delay: number              // 重试基础延迟(ms)，指数退避，默认 500
@@ -513,8 +508,8 @@ const client = createPublicClient({
 
 - [viem 官方文档](https://viem.sh)
 - [Cloudflare Workers 文档](https://workers.cloudflare.com)
-- [问题反馈](https://github.com/your-username/viem-proxy/issues)
-- [讨论区](https://github.com/your-username/viem-proxy/discussions)
+- [问题反馈](https://github.com/wmzy/viem-proxy/issues)
+- [讨论区](https://github.com/wmzy/viem-proxy/discussions)
 
 ---
 

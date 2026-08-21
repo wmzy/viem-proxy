@@ -43,6 +43,54 @@ export const getRpcUrls = (chainId: number): string[] => {
 };
 
 /**
+ * Explicit chain allowlist parsed from the optional `ALLOWED_CHAIN_IDS`
+ * environment variable. `null` means no allowlist is configured and every
+ * chain with RPC URLs (defaults ∪ custom) is servable.
+ */
+let allowedChainIds: ReadonlySet<number> | null = null;
+
+/**
+ * Set (or clear with `null`) the explicit chain allowlist. An empty set
+ * serves nothing — callers must fail closed, not silently widen access.
+ */
+export const setAllowedChainIds = (ids: ReadonlySet<number> | null): void => {
+  allowedChainIds = ids;
+};
+
+/**
+ * Whether `chainId` identifies a chain this worker may serve: a positive
+ * integer that has at least one configured upstream RPC URL (default or
+ * custom) and, when an allowlist is configured, is listed in it.
+ *
+ * Handlers MUST call this (or `parseChainIdParam`) before touching
+ * `PROXY_STATE.idFromName`: every unique `chain-${chainId}` name maps to a
+ * distinct Durable Object instance, so accepting arbitrary IDs lets
+ * outsiders provision unbounded DO instances at real cost. `getRpcUrls`
+ * would reject the chain eventually, but only after the instance exists.
+ */
+export const isSupportedChainId = (chainId: number): boolean => {
+  if (!Number.isInteger(chainId) || chainId <= 0) return false;
+  if (allowedChainIds !== null && !allowedChainIds.has(chainId)) return false;
+  try {
+    getRpcUrls(chainId);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+/**
+ * Parse a chain ID path segment and validate it with `isSupportedChainId`.
+ * Returns null for anything that is not a plain positive decimal integer
+ * naming a servable chain ("abc", "-1", "1.5", "0", "1e9" all fail).
+ */
+export const parseChainIdParam = (raw: string): number | null => {
+  if (!/^\d+$/.test(raw)) return null;
+  const chainId = Number.parseInt(raw, 10);
+  return isSupportedChainId(chainId) ? chainId : null;
+};
+
+/**
  * Default cap on concurrent upstream RPC calls per chain. Configurable at
  * runtime through the `MAX_RPC_CONCURRENCY` environment variable.
  */

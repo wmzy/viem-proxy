@@ -46,11 +46,11 @@
     "proxy",
     "blockchain"
   ],
-  "author": "Your Name",
+  "author": "wmzy <1256573276@qq.com>",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/your-username/viem-proxy.git"
+    "url": "https://github.com/wmzy/viem-proxy.git"
   },
   "peerDependencies": {
     "viem": "^2.0.0"
@@ -69,5 +69,6 @@
   },
   "engines": {
     "node": ">=18"
-  }
+  },
+  "packageManager": "pnpm@10.9.0"
 }

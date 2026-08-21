@@ -5,10 +5,36 @@ import type { Env } from "../src/types";
 import {
   executeRpcCall,
   getMaxRpcConcurrency,
+  isSupportedChainId,
+  parseChainIdParam,
   resetRpcConcurrency,
+  setAllowedChainIds,
   setMaxRpcConcurrency,
 } from "../src/actions/utils";
 import { handleBatchRequest, MAX_BATCH_SIZE } from "../src/handlers/batch";
+import { handleActionRequest } from "../src/handlers/actions";
+import {
+  handleCompressedRequest,
+  handleDirectRequest,
+} from "../src/handlers/proxy";
+import { timingSafeEqualString } from "../src/utils/auth";
+import { compressParams } from "../../src/utils/compression";
+
+// The DurableObject base class only exists in the Workers runtime; index.ts
+// re-exports the DO classes, so substitute a plain class for Node tests.
+vi.mock("cloudflare:workers", () => {
+  class DurableObject {
+    ctx: unknown;
+    env: unknown;
+    constructor(state: unknown, env: unknown) {
+      this.ctx = state;
+      this.env = env;
+    }
+  }
+  return { DurableObject };
+});
+
+import app from "../src/index";
 
 // Mock compression utils
 vi.mock("../src/utils/compression", () => ({
@@ -34,26 +60,6 @@ class MockDurableObjectStub {
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     const path = url.pathname;
-
-    // Mock params storage
-    if (request.method === "GET" && path.startsWith("/params/")) {
-      const hash = path.slice("/params/".length);
-      if (hash === "existing-hash") {
-        return new Response(JSON.stringify({ data: '["0x123", "latest"]' }), {
-          headers: { "Content-Type": "application/json" },
-        });
-      }
-      return new Response(JSON.stringify({ error: "Not found" }), {
-        status: 404,
-        headers: { "Content-Type": "application/json" },
-      });
-    }
-
-    if (request.method === "POST" && path === "/params") {
-      return new Response(JSON.stringify({ success: true }), {
-        headers: { "Content-Type": "application/json" },
-      });
-    }
 
     // Mock request deduplication
     if (request.method === "POST" && path === "/requests") {
@@ -290,20 +296,6 @@ describe("Mock Environment", () => {
     const stub = mockEnv.PROXY_STATE.get(id);
     expect(stub).toBeDefined();
     expect(stub.fetch).toBeDefined();
-  });
-
-  it("should handle DO fetch for params", async () => {
-    const stub = mockEnv.PROXY_STATE.get(mockEnv.PROXY_STATE.idFromName("test"));
-    
-    // Test existing params
-    const existingResponse = await stub.fetch(new Request("http://do/params/existing-hash"));
-    expect(existingResponse.ok).toBe(true);
-    const existingData = await existingResponse.json();
-    expect(existingData.data).toBeDefined();
-
-    // Test non-existing params
-    const missingResponse = await stub.fetch(new Request("http://do/params/missing-hash"));
-    expect(missingResponse.ok).toBe(false);
   });
 
   it("should handle DO fetch for request deduplication", async () => {
@@ -866,5 +858,437 @@ describe("RPC Concurrency Limit", () => {
     const next = await executeRpcCall(1, "eth_gasPrice", []);
     expect(next.result).toBe("0xc");
     expect(mockFetch).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("Compressed GET requests", () => {
+  const ADDRESS = "0x742d35Cc6634C0532925a3b844Bc9e7595f2bD18";
+  const VITALIK = "0xd8dA6BFEB93458525dE2fBD952BA38Ec8b18C1F1";
+
+  const compressedApp = new Hono<{ Bindings: Env }>();
+  compressedApp.get("/api/v1/:chainId/:method", handleCompressedRequest);
+
+  const rpcOk = (result: unknown) => ({
+    ok: true,
+    json: () => Promise.resolve({ jsonrpc: "2.0" as const, id: 1, result }),
+  });
+
+  const upstreamBody = (call = 0) => JSON.parse(mockFetch.mock.calls[call][1].body);
+
+  // The suite-wide vi.mock replaces server decompression with an identity
+  // function; borrow the real implementation for a single request so the
+  // client-side compressor is verified against the real server decoder.
+  const useRealDecompression = async () => {
+    const { decompressParams } = await import("../src/utils/compression");
+    const actual = await vi.importActual<typeof import("../src/utils/compression")>(
+      "../src/utils/compression"
+    );
+    vi.mocked(decompressParams).mockImplementationOnce(actual.decompressParams);
+  };
+
+  it("routes action-name GET requests through the action pipeline as eth_getBalance", async () => {
+    mockFetch.mockResolvedValueOnce(rpcOk("0xde0b6b3a7640000"));
+
+    const response = await compressedApp.request(
+      `/api/v1/1/getBalance?p=${encodeURIComponent(
+        JSON.stringify({ address: ADDRESS, blockTag: "latest" })
+      )}`,
+      undefined,
+      mockEnv as any
+    );
+
+    expect(response.status).toBe(200);
+    const data = await response.json();
+    expect(data.result).toBe("0xde0b6b3a7640000");
+    expect(data.timestamp).toBeTypeOf("number");
+    expect(response.headers.get("X-Cache")).toBe("MISS");
+
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+    expect(upstreamBody().method).toBe("eth_getBalance");
+    expect(upstreamBody().params).toEqual([ADDRESS, "latest"]);
+  });
+
+  it("accepts the real client compressParams output end-to-end (client ↔ server contract)", async () => {
+    await useRealDecompression();
+
+    // Exactly what src/actions/utils.ts send() puts on the wire for a GET:
+    // `${endpoint}/api/v1/1/getBalance?p=${compressed.compressed}`
+    const compressed = compressParams(JSON.stringify({ address: VITALIK, blockTag: "latest" }));
+    mockFetch.mockResolvedValueOnce(rpcOk("0x1"));
+
+    const response = await compressedApp.request(
+      `/api/v1/1/getBalance?p=${compressed.compressed}`,
+      undefined,
+      mockEnv as any
+    );
+
+    expect(response.status).toBe(200);
+    expect((await response.json()).result).toBe("0x1");
+
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+    expect(upstreamBody().method).toBe("eth_getBalance");
+    expect(upstreamBody().params).toEqual([VITALIK, "latest"]);
+  });
+
+  it("still passes raw RPC methods with array params straight to upstream", async () => {
+    await useRealDecompression();
+
+    const compressed = compressParams(JSON.stringify([ADDRESS, "latest"]));
+    mockFetch.mockResolvedValueOnce(rpcOk("0x2"));
+
+    const response = await compressedApp.request(
+      `/api/v1/1/eth_getBalance?p=${compressed.compressed}`,
+      undefined,
+      mockEnv as any
+    );
+
+    expect(response.status).toBe(200);
+    expect((await response.json()).result).toBe("0x2");
+
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+    expect(upstreamBody().method).toBe("eth_getBalance");
+    expect(upstreamBody().params).toEqual([ADDRESS, "latest"]);
+  });
+
+  it("keeps the pre-action passthrough when an action name carries array params", async () => {
+    mockFetch.mockResolvedValueOnce(rpcOk("0x3"));
+
+    const response = await compressedApp.request(
+      `/api/v1/1/getBalance?p=${encodeURIComponent(JSON.stringify([ADDRESS, "latest"]))}`,
+      undefined,
+      mockEnv as any
+    );
+
+    expect(response.status).toBe(200);
+    expect(upstreamBody().method).toBe("getBalance");
+    expect(upstreamBody().params).toEqual([ADDRESS, "latest"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Chain ID validation: pure helpers
+// ---------------------------------------------------------------------------
+
+describe("Chain ID validation helpers", () => {
+  afterEach(() => {
+    setAllowedChainIds(null);
+  });
+
+  describe("parseChainIdParam", () => {
+    it("accepts supported default chains", () => {
+      expect(parseChainIdParam("1")).toBe(1);
+      expect(parseChainIdParam("10")).toBe(10);
+      expect(parseChainIdParam("56")).toBe(56);
+      expect(parseChainIdParam("137")).toBe(137);
+      expect(parseChainIdParam("42161")).toBe(42161);
+    });
+
+    it("rejects non-numeric, non-positive and malformed segments", () => {
+      for (const raw of ["abc", "", "0", "-1", "1.5", "1e9", " 1", "1 ", "0x1"]) {
+        expect(parseChainIdParam(raw)).toBeNull();
+      }
+    });
+
+    it("rejects well-formed but unknown chain IDs", () => {
+      expect(parseChainIdParam("999999999")).toBeNull();
+      expect(parseChainIdParam("31337")).toBeNull();
+    });
+  });
+
+  describe("isSupportedChainId", () => {
+    it("rejects non-integers and non-positive values", () => {
+      expect(isSupportedChainId(1.5)).toBe(false);
+      expect(isSupportedChainId(0)).toBe(false);
+      expect(isSupportedChainId(-1)).toBe(false);
+      expect(isSupportedChainId(NaN)).toBe(false);
+    });
+
+    it("honors an explicit allowlist when one is set", () => {
+      setAllowedChainIds(new Set([137]));
+      expect(isSupportedChainId(137)).toBe(true);
+      // Chain 1 has RPC URLs configured but is not allowlisted
+      expect(isSupportedChainId(1)).toBe(false);
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Unsupported chain IDs must never create Durable Object instances
+// ---------------------------------------------------------------------------
+
+describe("Unsupported chain IDs never create Durable Objects", () => {
+  const ADDRESS = "0x742d35Cc6634C0532925a3b844Bc9e7595f2bD18";
+  const rpcOk = (result: unknown) => ({
+    ok: true,
+    json: () => Promise.resolve({ jsonrpc: "2.0" as const, id: 1, result }),
+  });
+
+  // PROXY_STATE namespace whose stub fetch is a spy: zero calls proves no
+  // Durable Object instance was ever provisioned or contacted.
+  const createSpyProxyState = () => {
+    const doFetch = vi.fn(async () =>
+      Response.json({ exists: false, created: true })
+    );
+    const env = {
+      ...mockEnv,
+      PROXY_STATE: {
+        idFromName: (name: string) => ({ name }),
+        get: () => ({ fetch: doFetch }),
+      },
+    };
+    return { env, doFetch };
+  };
+
+  it("POST /api/v1/:chainId/:action returns 400 without touching the DO", async () => {
+    const guardApp = new Hono<{ Bindings: Env }>();
+    guardApp.post("/api/v1/:chainId/:actionName", handleActionRequest);
+    const { env, doFetch } = createSpyProxyState();
+
+    for (const chainId of ["999999999", "abc"]) {
+      const response = await guardApp.request(
+        `/api/v1/${chainId}/getBalance`,
+        { method: "POST", body: JSON.stringify({ address: ADDRESS }) },
+        env as any
+      );
+      expect(response.status).toBe(400);
+      const data = await response.json();
+      expect(data.error.code).toBe(-32602);
+      expect(data.error.message).toContain("Unsupported chain ID");
+    }
+
+    expect(doFetch).not.toHaveBeenCalled(); // no DO instance contacted
+    expect(mockFetch).not.toHaveBeenCalled(); // no upstream RPC either
+  });
+
+  it("GET /api/v1/:chainId/:method (compressed) returns 400 without touching the DO", async () => {
+    const guardApp = new Hono<{ Bindings: Env }>();
+    guardApp.get("/api/v1/:chainId/:method", handleCompressedRequest);
+    const { env, doFetch } = createSpyProxyState();
+
+    const response = await guardApp.request(
+      `/api/v1/999999999/getBalance?p=${encodeURIComponent(
+        JSON.stringify({ address: ADDRESS, blockTag: "latest" })
+      )}`,
+      undefined,
+      env as any
+    );
+
+    expect(response.status).toBe(400);
+    expect((await response.json()).error.code).toBe(-32602);
+    expect(doFetch).not.toHaveBeenCalled();
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
+  it("POST /api/v1/direct/:chainId/:method returns 400 without touching the DO", async () => {
+    const guardApp = new Hono<{ Bindings: Env }>();
+    guardApp.post("/api/v1/direct/:chainId/:method", handleDirectRequest);
+    const { env, doFetch } = createSpyProxyState();
+
+    const response = await guardApp.request(
+      "/api/v1/direct/abc/eth_getBalance",
+      { method: "POST", body: JSON.stringify({ params: [ADDRESS, "latest"] }) },
+      env as any
+    );
+
+    expect(response.status).toBe(400);
+    expect((await response.json()).error.code).toBe(-32602);
+    expect(doFetch).not.toHaveBeenCalled();
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
+  it("batch items with unsupported chain IDs get per-item errors and no DO access", async () => {
+    const batchApp = new Hono<{ Bindings: Env }>();
+    batchApp.post("/api/v1/batch", handleBatchRequest);
+    const { env, doFetch } = createSpyProxyState();
+
+    const response = await batchApp.request(
+      "/api/v1/batch",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          requests: [
+            { id: "a", chainId: 999999999, action: "getBalance", args: { address: ADDRESS } },
+            { id: "b", chainId: 12345, action: "getBlockNumber" },
+          ],
+        }),
+      },
+      env as any
+    );
+
+    expect(response.status).toBe(200);
+    const data = await response.json();
+    for (const result of data.results) {
+      expect(result.error.code).toBe(-32602);
+      expect(result.error.message).toContain("Unsupported chain ID");
+    }
+    expect(doFetch).not.toHaveBeenCalled();
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
+  it("still routes supported chain IDs through to the DO (control)", async () => {
+    const guardApp = new Hono<{ Bindings: Env }>();
+    guardApp.post("/api/v1/:chainId/:actionName", handleActionRequest);
+    const { env, doFetch } = createSpyProxyState();
+    mockFetch.mockResolvedValueOnce(rpcOk("0x1"));
+
+    const response = await guardApp.request(
+      `/api/v1/1/getBalance`,
+      { method: "POST", body: JSON.stringify({ address: ADDRESS }) },
+      env as any
+    );
+
+    expect(response.status).toBe(200);
+    expect((await response.json()).result).toBe("0x1");
+    expect(doFetch).toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Constant-time API key comparison
+// ---------------------------------------------------------------------------
+
+describe("timingSafeEqualString", () => {
+  it("returns true for equal strings", () => {
+    expect(timingSafeEqualString("secret", "secret")).toBe(true);
+    expect(timingSafeEqualString("", "")).toBe(true);
+    expect(timingSafeEqualString("a b c", "a b c")).toBe(true);
+  });
+
+  it("returns false for different content of the same length", () => {
+    expect(timingSafeEqualString("secret", "secrft")).toBe(false);
+    expect(timingSafeEqualString("a", "b")).toBe(false);
+  });
+
+  it("returns false for different lengths, including prefix matches", () => {
+    expect(timingSafeEqualString("secret", "secret-extra")).toBe(false);
+    expect(timingSafeEqualString("secret-extra", "secret")).toBe(false);
+    expect(timingSafeEqualString("", "s")).toBe(false);
+    expect(timingSafeEqualString("s", "")).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// API key authentication middleware (app-level)
+// ---------------------------------------------------------------------------
+
+describe("API key authentication (app-level)", () => {
+  const ADDRESS = "0x742d35Cc6634C0532925a3b844Bc9e7595f2bD18";
+  const authEnv = { ...mockEnv, API_KEY: "test-secret-key" };
+  const rpcOk = (result: unknown) => ({
+    ok: true,
+    json: () => Promise.resolve({ jsonrpc: "2.0" as const, id: 1, result }),
+  });
+
+  it("rejects requests without credentials with 401", async () => {
+    const response = await app.request(
+      "/api/v1/1/getBalance",
+      { method: "POST", body: JSON.stringify({ address: ADDRESS }) },
+      authEnv as any
+    );
+
+    expect(response.status).toBe(401);
+    expect((await response.json()).error.code).toBe(-32600);
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
+  it("no longer accepts the key as a ?key= query parameter", async () => {
+    const response = await app.request(
+      "/api/v1/1/getBalance?key=test-secret-key",
+      { method: "POST", body: JSON.stringify({ address: ADDRESS }) },
+      authEnv as any
+    );
+
+    expect(response.status).toBe(401);
+    expect((await response.json()).error.code).toBe(-32600);
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
+  it("rejects a wrong or prefix-matching X-API-Key with 401", async () => {
+    for (const key of ["wrong-key", "test-secret-ke", ""]) {
+      const response = await app.request(
+        "/api/v1/1/getBalance",
+        { method: "POST", headers: { "X-API-Key": key }, body: "{}" },
+        authEnv as any
+      );
+      expect(response.status).toBe(401);
+    }
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
+  it("accepts the correct X-API-Key header and forwards to the handler", async () => {
+    mockFetch.mockResolvedValueOnce(rpcOk("0x1"));
+
+    const response = await app.request(
+      "/api/v1/1/getBalance",
+      {
+        method: "POST",
+        headers: { "X-API-Key": "test-secret-key" },
+        body: JSON.stringify({ address: ADDRESS }),
+      },
+      authEnv as any
+    );
+
+    expect(response.status).toBe(200);
+    expect((await response.json()).result).toBe("0x1");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ALLOWED_CHAIN_IDS allowlist (app-level)
+// ---------------------------------------------------------------------------
+
+describe("ALLOWED_CHAIN_IDS allowlist (app-level)", () => {
+  const ADDRESS = "0x742d35Cc6634C0532925a3b844Bc9e7595f2bD18";
+  const rpcOk = (result: unknown) => ({
+    ok: true,
+    json: () => Promise.resolve({ jsonrpc: "2.0" as const, id: 1, result }),
+  });
+
+  afterEach(() => {
+    setAllowedChainIds(null);
+  });
+
+  it("denies configured-but-not-allowlisted chains and serves allowlisted ones", async () => {
+    const allowEnv = { ...mockEnv, ALLOWED_CHAIN_IDS: "137" };
+
+    const denied = await app.request(
+      "/api/v1/1/getBalance",
+      { method: "POST", body: JSON.stringify({ address: ADDRESS }) },
+      allowEnv as any
+    );
+    expect(denied.status).toBe(400);
+    const data = await denied.json();
+    expect(data.error.code).toBe(-32602);
+    expect(data.error.message).toContain("Unsupported chain ID");
+    expect(mockFetch).not.toHaveBeenCalled();
+
+    // Chain 137 is both configured and allowlisted
+    mockFetch.mockResolvedValueOnce(rpcOk("0x9"));
+    const allowed = await app.request(
+      "/api/v1/137/getBalance",
+      { method: "POST", body: JSON.stringify({ address: ADDRESS }) },
+      allowEnv as any
+    );
+    expect(allowed.status).toBe(200);
+    expect((await allowed.json()).result).toBe("0x9");
+  });
+
+  it("restores the default (all configured chains) when the var is unset", async () => {
+    const allowEnv = { ...mockEnv, ALLOWED_CHAIN_IDS: "137" };
+    await app.request(
+      "/api/v1/1/getBalance",
+      { method: "POST", body: "{}" },
+      allowEnv as any
+    ); // sets the allowlist for this request
+
+    mockFetch.mockResolvedValueOnce(rpcOk("0x1"));
+    const response = await app.request(
+      "/api/v1/1/getBalance",
+      { method: "POST", body: JSON.stringify({ address: ADDRESS }) },
+      mockEnv as any // no ALLOWED_CHAIN_IDS -> allowlist cleared again
+    );
+    expect(response.status).toBe(200);
+    expect((await response.json()).result).toBe("0x1");
   });
 });

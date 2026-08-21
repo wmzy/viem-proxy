@@ -52,10 +52,4 @@ export type { PreheatRequest, PreheatResult } from "./actions/preheat.client";
 export { addMiddleware, clearMiddlewares, getMiddlewares } from "./actions/middleware";
 
 // Export compression utilities
-export {
-  compressParams,
-  decompressParams,
-  generateParamHash,
-  shouldCompress,
-  shouldUseHashReference,
-} from "./utils/compression";
+export { compressParams } from "./utils/compression";

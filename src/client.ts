@@ -9,7 +9,6 @@ import {
 import type { ProxyPublicClient, ProxyConfig, PerformanceMetrics, ProxyMiddleware } from "./types";
 import { proxyActions } from "./actions/proxyActions";
 import { batchClientActions } from "./actions/batch.client";
-import type { BatchRequest, BatchResult } from "./actions/batch.client";
 import { addMiddleware } from "./actions/middleware";
 import { preheatCache as runPreheat } from "./actions/preheat.client";
 import type { PreheatRequest, PreheatResult } from "./actions/preheat.client";

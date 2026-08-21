@@ -7,30 +7,6 @@ describe("Index exports", () => {
     expect(typeof exports.compressParams).toBe("function");
   });
 
-  it("should export decompressParams function", async () => {
-    const exports = await import("../index");
-    expect(exports.decompressParams).toBeDefined();
-    expect(typeof exports.decompressParams).toBe("function");
-  });
-
-  it("should export generateParamHash function", async () => {
-    const exports = await import("../index");
-    expect(exports.generateParamHash).toBeDefined();
-    expect(typeof exports.generateParamHash).toBe("function");
-  });
-
-  it("should export shouldCompress function", async () => {
-    const exports = await import("../index");
-    expect(exports.shouldCompress).toBeDefined();
-    expect(typeof exports.shouldCompress).toBe("function");
-  });
-
-  it("should export shouldUseHashReference function", async () => {
-    const exports = await import("../index");
-    expect(exports.shouldUseHashReference).toBeDefined();
-    expect(typeof exports.shouldUseHashReference).toBe("function");
-  });
-
   it("should export http transport function from viem", async () => {
     const exports = await import("../index");
     expect(exports.http).toBeDefined();
@@ -93,20 +69,6 @@ describe("Index exports", () => {
     const compressed = exports.compressParams(testParams);
     expect(compressed.compressed).toBeDefined();
     expect(compressed.originalSize).toBe(testParams.length);
-
-    const decompressed = exports.decompressParams(compressed.compressed);
-    expect(decompressed).toBe(testParams);
-  });
-
-  it("should test hash generation", async () => {
-    const exports = await import("../index");
-
-    const testParams = '["0x123", "latest"]';
-    const hash1 = await exports.generateParamHash(testParams);
-    const hash2 = await exports.generateParamHash(testParams);
-
-    expect(hash1).toBe(hash2);
-    expect(hash1).toHaveLength(64); // SHA-256 hex
   });
 
   it("should import chains correctly", async () => {

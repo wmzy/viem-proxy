@@ -7,8 +7,6 @@ export type ProxyConfig = {
   enabled: boolean;
   /** Workers endpoint */
   endpoint: string;
-  /** Workers endpoints list (for load balancing) */
-  endpoints?: string[];
   /** Request timeout (ms) */
   timeout?: number;
   /** Enable fallback to original RPC */
@@ -17,10 +15,6 @@ export type ProxyConfig = {
   debug?: boolean;
   /** API key for authentication */
   apiKey?: string;
-  /** Custom cache strategy */
-  cacheControl?: {
-    [method: string]: number;
-  };
   /** Retry options */
   retryOptions?: {
     attempts: number;
@@ -37,7 +31,7 @@ export type ProxyTransportConfig = {
   proxy?: Partial<ProxyConfig>;
 };
 
-export type RequestStrategy = "compressed" | "hash-reference" | "direct";
+export type RequestStrategy = "compressed" | "direct";
 
 export type CompressedRequest = {
   strategy: RequestStrategy;

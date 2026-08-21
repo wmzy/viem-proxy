@@ -3,12 +3,6 @@ main = "src/index.ts"
 compatibility_date = "2024-01-01"
 compatibility_flags = ["nodejs_compat"]
 
-[env.production]
-name = "viem-proxy-workers"
-
-[env.staging]
-name = "viem-proxy-workers-staging"
-
 # Durable Objects configuration
 [[durable_objects.bindings]]
 name = "PROXY_STATE"
@@ -37,6 +31,6 @@ MAX_RPC_CONCURRENCY = "10"  # concurrent upstream RPC calls allowed per chain; e
 # Batch endpoint cap is the compile-time constant MAX_BATCH_SIZE (50 items) in workers/src/handlers/batch.ts
 # API_KEY = ""  # Set via `wrangler secret put API_KEY` for authentication
 # RPC_URLS = '{"1":["https://eth.llamarpc.com"]}'  # JSON map of chainId -> URL[]
-
-[build]
-command = "npm run build"
+# ALLOWED_CHAIN_IDS = "1,137"  # Optional comma-separated allowlist of servable chain IDs.
+#   When unset (default), every chain with a configured upstream RPC URL is allowed
+#   (the union of the built-in DEFAULT_RPC_URLS chains and any RPC_URLS entries).

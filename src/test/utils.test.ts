@@ -574,7 +574,7 @@ describe("Action Utils", () => {
         responseTimeP95: 0,
         responseTimeP99: 0,
         chainIds: [],
-        strategyCounts: { compressed: 0, "hash-reference": 0, direct: 0 },
+        strategyCounts: { compressed: 0, direct: 0 },
         methodStats: {},
       });
     });
@@ -595,7 +595,7 @@ describe("Action Utils", () => {
       expect(snapshot.averageResponseTime).toBe(20);
       expect(snapshot.responseTimeP50).toBe(20);
       expect(snapshot.chainIds).toEqual([1, 137]);
-      expect(snapshot.strategyCounts).toEqual({ compressed: 2, "hash-reference": 0, direct: 1 });
+      expect(snapshot.strategyCounts).toEqual({ compressed: 2, direct: 1 });
 
       expect(snapshot.methodStats.getBalance).toEqual({
         count: 2,
@@ -672,7 +672,7 @@ describe("Action Utils", () => {
       const snapshot = collector.getSnapshot();
       expect(snapshot.totalRequests).toBe(0);
       expect(snapshot.methodStats).toEqual({});
-      expect(snapshot.strategyCounts).toEqual({ compressed: 0, "hash-reference": 0, direct: 0 });
+      expect(snapshot.strategyCounts).toEqual({ compressed: 0, direct: 0 });
     });
 
     it("should share one module-level collector and reset it via resetMetrics", () => {

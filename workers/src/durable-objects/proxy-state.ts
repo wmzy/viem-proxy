@@ -12,16 +12,14 @@ type PendingRequest = {
   completed_at: number | null;
 };
 
-type StoredParam = {
-  hash: string;
-  data: string;
-  created_at: number;
-  expires_at: number;
-};
+/** How long a completed/failed result stays valid for dedup hits */
+const RESULT_TTL_MS = 30 * 1000;
+/** How long a pending record is considered active before it is treated as gone */
+const PENDING_TTL_MS = 5 * 60 * 1000;
 
 /**
  * ProxyState Durable Object
- * Handles parameter storage and request deduplication
+ * Handles request deduplication
  */
 export class ProxyState extends DurableObject<Env> {
   private initialized = false;
@@ -31,16 +29,6 @@ export class ProxyState extends DurableObject<Env> {
    */
   private async ensureInitialized(): Promise<void> {
     if (this.initialized) return;
-
-    // Create params table
-    this.ctx.storage.sql.exec(`
-      CREATE TABLE IF NOT EXISTS params (
-        hash TEXT PRIMARY KEY,
-        data TEXT NOT NULL,
-        created_at INTEGER NOT NULL,
-        expires_at INTEGER NOT NULL
-      )
-    `);
 
     // Create pending_requests table
     this.ctx.storage.sql.exec(`
@@ -55,9 +43,6 @@ export class ProxyState extends DurableObject<Env> {
     `);
 
     // Create indexes for efficient cleanup
-    this.ctx.storage.sql.exec(`
-      CREATE INDEX IF NOT EXISTS idx_params_expires ON params(expires_at)
-    `);
     this.ctx.storage.sql.exec(`
       CREATE INDEX IF NOT EXISTS idx_requests_created ON pending_requests(created_at)
     `);
@@ -86,21 +71,15 @@ export class ProxyState extends DurableObject<Env> {
   private async cleanup(): Promise<void> {
     const now = Date.now();
 
-    // Delete expired params (7 days)
-    this.ctx.storage.sql.exec(
-      `DELETE FROM params WHERE expires_at < ?`,
-      now
-    );
-
     // Delete old pending requests (5 minutes)
-    const pendingTimeout = now - 5 * 60 * 1000;
+    const pendingTimeout = now - PENDING_TTL_MS;
     this.ctx.storage.sql.exec(
       `DELETE FROM pending_requests WHERE status = 'pending' AND created_at < ?`,
       pendingTimeout
     );
 
     // Delete completed requests (30 seconds)
-    const completedTimeout = now - 30 * 1000;
+    const completedTimeout = now - RESULT_TTL_MS;
     this.ctx.storage.sql.exec(
       `DELETE FROM pending_requests WHERE status IN ('completed', 'failed') AND completed_at < ?`,
       completedTimeout
@@ -108,49 +87,29 @@ export class ProxyState extends DurableObject<Env> {
   }
 
   /**
-   * Store parameter hash mapping
-   */
-  async storeParams(hash: string, data: string): Promise<void> {
-    await this.ensureInitialized();
-
-    const now = Date.now();
-    const expiresAt = now + 7 * 24 * 60 * 60 * 1000; // 7 days
-
-    this.ctx.storage.sql.exec(
-      `INSERT OR REPLACE INTO params (hash, data, created_at, expires_at) VALUES (?, ?, ?, ?)`,
-      hash,
-      data,
-      now,
-      expiresAt
-    );
-  }
-
-  /**
-   * Get stored parameters by hash
-   */
-  async getParams(hash: string): Promise<string | null> {
-    await this.ensureInitialized();
-
-    const result = this.ctx.storage.sql.exec<StoredParam>(
-      `SELECT data FROM params WHERE hash = ? AND expires_at > ?`,
-      hash,
-      Date.now()
-    );
-
-    const rows = [...result];
-    return rows.length > 0 ? rows[0].data : null;
-  }
-
-  /**
    * Check if a request is pending or completed
    * Returns the pending request info if found
+   *
+   * Freshness filtering mirrors cleanup() so stale rows are treated as
+   * nonexistent on the read path instead of waiting for the hourly alarm:
+   * completed/failed results are served for RESULT_TTL_MS and pending
+   * entries for PENDING_TTL_MS. This bounds the stale-result and cached-
+   * error poisoning window to the designed TTLs.
    */
   async checkPendingRequest(requestHash: string): Promise<PendingRequest | null> {
     await this.ensureInitialized();
 
+    const now = Date.now();
     const result = this.ctx.storage.sql.exec<PendingRequest>(
-      `SELECT * FROM pending_requests WHERE request_hash = ?`,
-      requestHash
+      `SELECT * FROM pending_requests
+       WHERE request_hash = ?
+         AND (
+           (status = 'pending' AND created_at > ?)
+           OR (status IN ('completed', 'failed') AND completed_at > ?)
+         )`,
+      requestHash,
+      now - PENDING_TTL_MS,
+      now - RESULT_TTL_MS
     );
 
     const rows = [...result];
@@ -163,11 +122,29 @@ export class ProxyState extends DurableObject<Env> {
   async createPendingRequest(requestHash: string): Promise<boolean> {
     await this.ensureInitialized();
 
+    const now = Date.now();
+    // Drop the previous record for this hash if it is stale (expired
+    // completed/failed result or abandoned pending entry) so the hash can
+    // be reused; fresh records are left untouched. This complements the
+    // freshness filter in checkPendingRequest: expired records are treated
+    // as nonexistent, which includes allowing the hash to be re-registered.
+    this.ctx.storage.sql.exec(
+      `DELETE FROM pending_requests
+       WHERE request_hash = ?
+         AND (
+           (status = 'pending' AND created_at <= ?)
+           OR (status IN ('completed', 'failed') AND completed_at <= ?)
+         )`,
+      requestHash,
+      now - PENDING_TTL_MS,
+      now - RESULT_TTL_MS
+    );
+
     try {
       this.ctx.storage.sql.exec(
         `INSERT INTO pending_requests (request_hash, status, created_at) VALUES (?, 'pending', ?)`,
         requestHash,
-        Date.now()
+        now
       );
       return true;
     } catch {
@@ -221,30 +198,6 @@ export class ProxyState extends DurableObject<Env> {
     const path = url.pathname;
 
     try {
-      // Store params: POST /params
-      if (request.method === "POST" && path === "/params") {
-        const { hash, data } = await request.json<{ hash: string; data: string }>();
-        await this.storeParams(hash, data);
-        return new Response(JSON.stringify({ success: true }), {
-          headers: { "Content-Type": "application/json" },
-        });
-      }
-
-      // Get params: GET /params/:hash
-      if (request.method === "GET" && path.startsWith("/params/")) {
-        const hash = path.slice("/params/".length);
-        const data = await this.getParams(hash);
-        if (data) {
-          return new Response(JSON.stringify({ data }), {
-            headers: { "Content-Type": "application/json" },
-          });
-        }
-        return new Response(JSON.stringify({ error: "Not found" }), {
-          status: 404,
-          headers: { "Content-Type": "application/json" },
-        });
-      }
-
       // Check/create pending request: POST /requests
       if (request.method === "POST" && path === "/requests") {
         const { requestHash } = await request.json<{ requestHash: string }>();

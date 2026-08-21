@@ -5,13 +5,16 @@ import { prettyJSON } from "hono/pretty-json";
 import type { Env } from "./types";
 import {
   handleCompressedRequest,
-  handleHashReferenceRequest,
-  handleStoreParams,
   handleDirectRequest,
 } from "./handlers/proxy";
 import { handleActionRequest } from "./handlers/actions";
 import { handleBatchRequest } from "./handlers/batch";
-import { setCustomRpcUrls, setMaxRpcConcurrency } from "./actions/utils";
+import {
+  setAllowedChainIds,
+  setCustomRpcUrls,
+  setMaxRpcConcurrency,
+} from "./actions/utils";
+import { timingSafeEqualString } from "./utils/auth";
 import { resolveTraceId } from "./utils/cache";
 import {
   aggregatePeriods,
@@ -31,7 +34,7 @@ app.use(
   cors({
     origin: "*",
     allowMethods: ["GET", "POST", "OPTIONS"],
-    allowHeaders: ["Content-Type", "X-Param-Hash", "X-Original-Params", "X-API-Key"],
+    allowHeaders: ["Content-Type", "X-API-Key"],
   })
 );
 
@@ -70,6 +73,23 @@ app.use("/api/*", async (c, next) => {
     }
   }
 
+  // Optional explicit chain allowlist. When ALLOWED_CHAIN_IDS is unset,
+  // every chain with a configured upstream RPC URL (DEFAULT_RPC_URLS ∪
+  // RPC_URLS) is servable; when set, only the listed IDs are. Unparseable
+  // entries are dropped, so an allowlist that parses to nothing serves
+  // nothing — fail closed rather than silently widening access.
+  const allowedChainIdsRaw = c.env.ALLOWED_CHAIN_IDS;
+  if (allowedChainIdsRaw) {
+    const ids = new Set<number>();
+    for (const part of allowedChainIdsRaw.split(",")) {
+      const id = Number.parseInt(part.trim(), 10);
+      if (Number.isInteger(id) && id > 0) ids.add(id);
+    }
+    setAllowedChainIds(ids);
+  } else {
+    setAllowedChainIds(null);
+  }
+
   const maxConcurrency = c.env.MAX_RPC_CONCURRENCY;
   if (maxConcurrency) {
     const limit = Number(maxConcurrency);
@@ -78,10 +98,14 @@ app.use("/api/*", async (c, next) => {
     }
   }
 
+  // Authentication: the X-API-Key header only. Query-string keys (`?key=`)
+  // are deliberately not accepted — they would leak into CDN cache keys and
+  // access logs. The comparison is constant-time so response latency does
+  // not reveal the expected key.
   const apiKey = c.env.API_KEY;
   if (apiKey) {
-    const provided = c.req.header("X-API-Key") ?? c.req.query("key");
-    if (provided !== apiKey) {
+    const provided = c.req.header("X-API-Key");
+    if (provided === undefined || !timingSafeEqualString(provided, apiKey)) {
       return c.json(
         { error: { code: -32600, message: "Unauthorized" } },
         401
@@ -112,12 +136,6 @@ app.post("/api/v1/:chainId/:actionName", handleActionRequest);
 
 // Compressed parameter requests (GET for CDN caching)
 app.get("/api/v1/:chainId/:method", handleCompressedRequest);
-
-// Hash reference requests
-app.get("/api/v1/cached/:cacheKey", handleHashReferenceRequest);
-
-// Parameter storage
-app.post("/api/v1/store", handleStoreParams);
 
 // Direct requests
 app.post("/api/v1/direct/:chainId/:method", handleDirectRequest);

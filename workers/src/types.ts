@@ -11,6 +11,11 @@ export type Env = {
   FINALIZED_BLOCK_CACHE_TTL: string;
   API_KEY?: string;
   RPC_URLS?: string;
+  /**
+   * Optional comma-separated allowlist of servable chain IDs (e.g. "1,137").
+   * Unset = every chain with a configured upstream RPC URL is allowed.
+   */
+  ALLOWED_CHAIN_IDS?: string;
   /** Per-chain upstream RPC concurrency cap (default 10) */
   MAX_RPC_CONCURRENCY?: string;
 };
@@ -57,7 +62,7 @@ export type RequestInfo = {
   chainId: number;
   method: string;
   params: any[];
-  strategy: "compressed" | "hash-reference" | "direct" | "function";
+  strategy: "compressed" | "direct" | "function";
 };
 
 // Function-based request types

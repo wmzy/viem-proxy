@@ -17,7 +17,16 @@ import {
 } from "../utils/cache";
 import { recordRequestStats } from "../utils/statistics";
 import type { CacheStatus } from "../types";
-import { getRpcUrls, executeRpcCall as sharedExecuteRpcCall } from "../actions/utils";
+import {
+  getRpcUrls,
+  executeRpcCall as sharedExecuteRpcCall,
+  parseChainIdParam,
+} from "../actions/utils";
+import { actionHandlers, type ActionName } from "../actions";
+import {
+  executeWithDeduplication as executeActionWithDeduplication,
+  ACTION_TO_RPC_METHOD,
+} from "./actions";
 
 const getProxyState = (c: Context<{ Bindings: Env }>, chainId: number) => {
   const id = c.env.PROXY_STATE.idFromName(`chain-${chainId}`);
@@ -99,9 +108,23 @@ const executeWithDeduplication = async (
           error?: string;
         }>();
         if (status.status === "completed" && status.result) {
-          return JSON.parse(status.result);
+          recordRequestStats(c, {
+            method: requestInfo.method,
+            chainId: requestInfo.chainId,
+            cacheStatus: "HIT",
+            error: false,
+            durationMs: 0,
+          });
+          return { ...JSON.parse(status.result), cacheStatus: "HIT" };
         }
         if (status.status === "failed" && status.error) {
+          recordRequestStats(c, {
+            method: requestInfo.method,
+            chainId: requestInfo.chainId,
+            cacheStatus: "HIT",
+            error: true,
+            durationMs: 0,
+          });
           throw new Error(status.error);
         }
       }
@@ -175,20 +198,77 @@ export const handleCompressedRequest = async (
       );
     }
 
+    // Reject unsupported chain IDs before any Durable Object is created:
+    // each unique `chain-${chainId}` name provisions a distinct PROXY_STATE
+    // instance, so unvalidated IDs let outsiders mint DO instances at will.
+    const chainIdNum = parseChainIdParam(chainId);
+    if (chainIdNum === null) {
+      return c.json(
+        {
+          error: {
+            code: -32602,
+            message: `Unsupported chain ID: ${chainId}`,
+          },
+        },
+        400
+      );
+    }
+
     // Decompress parameters
     const paramsStr = decompressParams(compressedParams);
     const params = JSON.parse(paramsStr);
+    const traceId = resolveTraceId(c.req.header("X-Trace-Id"));
+
+    // The client's default path sends action names (e.g. `getBalance`) with
+    // a compressed args object. Route those through the exact same pipeline
+    // as POST /api/v1/:chainId/:actionName so args are converted to RPC
+    // params by the action handlers. Anything else (e.g. `eth_getBalance`
+    // with a params array) is passed through to the upstream node as a raw
+    // RPC call, preserving the direct-RPC contract.
+    if (
+      method in actionHandlers &&
+      typeof params === "object" &&
+      params !== null &&
+      !Array.isArray(params)
+    ) {
+      const actionName = method as ActionName;
+      const result = await executeActionWithDeduplication(
+        c,
+        chainIdNum,
+        actionName,
+        params as Record<string, unknown>
+      );
+
+      const rpcMethod = ACTION_TO_RPC_METHOD[actionName] ?? actionName;
+      const cacheStrategy = getCacheStrategy(
+        chainIdNum,
+        rpcMethod,
+        params,
+        300,
+        result.blockNumber ? parseInt(result.blockNumber, 16) : undefined
+      );
+
+      const response = c.json({
+        result: result.result,
+        blockNumber: result.blockNumber,
+        timestamp: Date.now(),
+      });
+
+      return setCacheHeaders(response, cacheStrategy.ttl, {
+        cacheStatus: result.cacheStatus,
+        traceId,
+      });
+    }
 
     // Build request info
     const requestInfo: RequestInfo = {
-      chainId: parseInt(chainId),
+      chainId: chainIdNum,
       method,
       params,
       strategy: "compressed",
     };
 
     // Execute RPC call with deduplication
-    const traceId = resolveTraceId(c.req.header("X-Trace-Id"));
     const result = await executeWithDeduplication(c, requestInfo);
 
     // Set cache strategy
@@ -227,174 +307,31 @@ export const handleCompressedRequest = async (
 };
 
 /**
- * Handle hash reference GET requests
- */
-export const handleHashReferenceRequest = async (
-  c: Context<{ Bindings: Env }>
-) => {
-  try {
-    const cacheKey = c.req.param("cacheKey");
-    const [chainIdStr, method, paramHash] = cacheKey.split(":");
-
-    if (!chainIdStr || !method || !paramHash) {
-      return c.json(
-        { error: { code: -32602, message: "Invalid cache key format" } },
-        400
-      );
-    }
-
-    const chainId = parseInt(chainIdStr);
-    const proxyState = getProxyState(c, chainId);
-
-    // Try to get params from DO
-    const paramsResponse = await proxyState.fetch(
-      new Request(`http://do/params/${paramHash}`)
-    );
-
-    let storedParams: string | null = null;
-    if (paramsResponse.ok) {
-      const paramsResult = await paramsResponse.json<{ data: string }>();
-      storedParams = paramsResult.data;
-    }
-
-    if (!storedParams) {
-      // Check request header for original params (first request)
-      const originalParams = c.req.header("X-Original-Params");
-
-      if (originalParams) {
-        // Store params in DO
-        await proxyState.fetch(
-          new Request("http://do/params", {
-            method: "POST",
-            body: JSON.stringify({ hash: paramHash, data: originalParams }),
-          })
-        );
-
-        const params = JSON.parse(originalParams);
-        const requestInfo: RequestInfo = {
-          chainId,
-          method,
-          params,
-          strategy: "hash-reference",
-        };
-
-        const traceId = resolveTraceId(c.req.header("X-Trace-Id"));
-        const result = await executeWithDeduplication(c, requestInfo);
-        const cacheStrategy = getCacheStrategy(chainId, method, params);
-
-        const response = c.json({
-          result: result.result,
-          blockNumber: result.blockNumber,
-          timestamp: Date.now(),
-        });
-
-        return setCacheHeaders(response, cacheStrategy.ttl, {
-          cacheStatus: result.cacheStatus,
-          traceId,
-        });
-      }
-
-      return c.json(
-        { error: { code: -32601, message: "Parameters not found" } },
-        404
-      );
-    }
-
-    // Use stored params
-    const params = JSON.parse(storedParams);
-    const requestInfo: RequestInfo = {
-      chainId,
-      method,
-      params,
-      strategy: "hash-reference",
-    };
-
-    const traceId = resolveTraceId(c.req.header("X-Trace-Id"));
-    const result = await executeWithDeduplication(c, requestInfo);
-    const cacheStrategy = getCacheStrategy(chainId, method, params);
-
-    const response = c.json({
-      result: result.result,
-      blockNumber: result.blockNumber,
-      timestamp: Date.now(),
-    });
-
-    return setCacheHeaders(response, cacheStrategy.ttl, {
-      cacheStatus: result.cacheStatus,
-      traceId,
-    });
-  } catch (error) {
-    console.error("Hash reference request error:", error);
-    const isDebug = c.env.ENVIRONMENT !== "production";
-    return c.json(
-      {
-        error: {
-          code: -32603,
-          message: "Internal error",
-          ...(isDebug ? { data: error instanceof Error ? error.message : "Unknown error" } : {}),
-        },
-      },
-      500
-    );
-  }
-};
-
-/**
- * Handle parameter storage requests
- */
-export const handleStoreParams = async (c: Context<{ Bindings: Env }>) => {
-  try {
-    const { hash, params } = await c.req.json();
-
-    if (!hash || !params) {
-      return c.json(
-        { error: { code: -32602, message: "Missing hash or params" } },
-        400
-      );
-    }
-
-    // Verify hash
-    const expectedHash = await generateParamHash(params);
-    if (hash !== expectedHash) {
-      return c.json({ error: { code: -32602, message: "Hash mismatch" } }, 400);
-    }
-
-    const id = c.env.PROXY_STATE.idFromName("params-store");
-    const proxyState = c.env.PROXY_STATE.get(id);
-    await proxyState.fetch(
-      new Request("http://do/params", {
-        method: "POST",
-        body: JSON.stringify({ hash, data: params }),
-      })
-    );
-
-    return c.json({ success: true });
-  } catch (error) {
-    console.error("Store params error:", error);
-    const isDebug = c.env.ENVIRONMENT !== "production";
-    return c.json(
-      {
-        error: {
-          code: -32603,
-          message: "Internal error",
-          ...(isDebug ? { data: error instanceof Error ? error.message : "Unknown error" } : {}),
-        },
-      },
-      500
-    );
-  }
-};
-
-/**
  * Handle direct RPC calls
  */
 export const handleDirectRequest = async (c: Context<{ Bindings: Env }>) => {
   try {
     const { chainId, method } = c.req.param();
+
+    // Reject unsupported chain IDs before any Durable Object is created
+    // (each unique `chain-${chainId}` name provisions a distinct instance).
+    const chainIdNum = parseChainIdParam(chainId);
+    if (chainIdNum === null) {
+      return c.json(
+        {
+          error: {
+            code: -32602,
+            message: `Unsupported chain ID: ${chainId}`,
+          },
+        },
+        400
+      );
+    }
+
     const rpcRequest: RpcRequest = await c.req.json();
 
     const requestInfo: RequestInfo = {
-      chainId: parseInt(chainId),
+      chainId: chainIdNum,
       method,
       params: rpcRequest.params,
       strategy: "direct",
@@ -453,13 +390,29 @@ export const handleDirectRequest = async (c: Context<{ Bindings: Env }>) => {
 export const handleFunctionRequest = async (c: Context<{ Bindings: Env }>) => {
   try {
     const { chainId, functionName } = c.req.param();
+
+    // Reject unsupported chain IDs before any Durable Object is created
+    // (each unique `chain-${chainId}` name provisions a distinct instance).
+    const chainIdNum = parseChainIdParam(chainId);
+    if (chainIdNum === null) {
+      return c.json(
+        {
+          error: {
+            code: -32602,
+            message: `Unsupported chain ID: ${chainId}`,
+          },
+        },
+        400
+      );
+    }
+
     const args = await c.req.json();
 
     // Convert function call to RPC method and params
     const { method, params } = convertFunctionToRpc(functionName, args);
 
     const requestInfo: RequestInfo = {
-      chainId: parseInt(chainId),
+      chainId: chainIdNum,
       method,
       params,
       strategy: "function",

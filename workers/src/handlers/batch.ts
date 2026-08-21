@@ -1,6 +1,7 @@
 import { type Context } from "hono";
 import type { Env } from "../types";
 import { actionHandlers, type ActionName } from "../actions";
+import { isSupportedChainId } from "../actions/utils";
 import { executeWithDeduplication } from "./actions";
 
 /** Upper bound on items accepted in one batch request. */
@@ -94,6 +95,18 @@ export const handleBatchRequest = async (c: Context<{ Bindings: Env }>) => {
 
   const results: BatchItemResult[] = await Promise.all(
     items.map(async (item): Promise<BatchItemResult> => {
+      // Validate before executing: an unsupported chain ID must never reach
+      // executeWithDeduplication, which provisions a Durable Object per
+      // unique `chain-${chainId}` name.
+      if (!isSupportedChainId(item.chainId)) {
+        return {
+          id: item.id,
+          error: {
+            code: -32602,
+            message: `Unsupported chain ID: ${item.chainId}`,
+          },
+        };
+      }
       if (!(item.action in actionHandlers)) {
         return {
           id: item.id,

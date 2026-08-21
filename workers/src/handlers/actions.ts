@@ -1,11 +1,12 @@
 import { type Context } from "hono";
 import type { CacheStatus, Env } from "../types";
 import { actionHandlers, type ActionName, type ActionContext } from "../actions";
+import { parseChainIdParam } from "../actions/utils";
 import { getCacheStrategy, resolveTraceId, setCacheHeaders } from "../utils/cache";
 import { recordRequestStats } from "../utils/statistics";
 import { generateParamHash } from "../utils/compression";
 
-const ACTION_TO_RPC_METHOD: Record<string, string> = {
+export const ACTION_TO_RPC_METHOD: Record<string, string> = {
   getBalance: "eth_getBalance",
   getBlock: "eth_getBlockByNumber",
   getBlockNumber: "eth_blockNumber",
@@ -103,9 +104,23 @@ export const executeWithDeduplication = async <T>(
           error?: string;
         }>();
         if (status.status === "completed" && status.result) {
-          return JSON.parse(status.result);
+          recordRequestStats(c, {
+            method: ACTION_TO_RPC_METHOD[actionName] ?? actionName,
+            chainId,
+            cacheStatus: "HIT",
+            error: false,
+            durationMs: 0,
+          });
+          return { ...JSON.parse(status.result), cacheStatus: "HIT" };
         }
         if (status.status === "failed" && status.error) {
+          recordRequestStats(c, {
+            method: ACTION_TO_RPC_METHOD[actionName] ?? actionName,
+            chainId,
+            cacheStatus: "HIT",
+            error: true,
+            durationMs: 0,
+          });
           throw new Error(status.error);
         }
       }
@@ -176,6 +191,23 @@ export const executeWithDeduplication = async <T>(
 export const handleActionRequest = async (c: Context<{ Bindings: Env }>) => {
   try {
     const { chainId, actionName } = c.req.param();
+
+    // Reject unsupported chain IDs before any Durable Object is created:
+    // each unique `chain-${chainId}` name provisions a distinct PROXY_STATE
+    // instance, so unvalidated IDs let outsiders mint DO instances at will.
+    const chainIdNum = parseChainIdParam(chainId);
+    if (chainIdNum === null) {
+      return c.json(
+        {
+          error: {
+            code: -32602,
+            message: `Unsupported chain ID: ${chainId}`,
+          },
+        },
+        400
+      );
+    }
+
     const args = await c.req.json();
 
     // Validate action name
@@ -191,7 +223,6 @@ export const handleActionRequest = async (c: Context<{ Bindings: Env }>) => {
       );
     }
 
-    const chainIdNum = parseInt(chainId);
     const traceId = resolveTraceId(c.req.header("X-Trace-Id"));
     const result = await executeWithDeduplication(
       c,
