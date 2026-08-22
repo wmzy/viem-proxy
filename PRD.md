@@ -62,12 +62,18 @@ const client = createPublicClient({
 })
 ```
 
-**缓存策略**：
-- **历史数据**（区块号 < latest - 100）：缓存 1 年
-- **近期数据**（区块号 >= latest - 100）：缓存 10 分钟
-- **最新数据**（latest、pending）：缓存 12 秒
-- **账户状态**：缓存 30 秒
-- **合约常量**：缓存 1 小时
+**缓存策略**（与 `workers/src/utils/cache.ts` 实现一致）：
+- **历史交易数据**（`eth_getBlockByHash`、`eth_getTransactionByHash`、`eth_getTransactionReceipt`）：缓存 1 年
+- **Finalized 区块**（`eth_getBlockByNumber`、`eth_getStorageAt`，`finalized` 标签或确认数 ≥ epoch）：缓存 30 天
+- **较新区块**（确认数 < epoch）：缓存 5 分钟
+- **最新数据**（`eth_blockNumber`、`eth_gasPrice`、`eth_estimateGas`、`eth_feeHistory`、`eth_blobBaseFee`、latest/pending 块参数）：缓存 12 秒
+- **账户状态**（`eth_getBalance`、`eth_call`、`eth_getTransactionCount`）：缓存 30 秒
+- **合约代码**（`eth_getCode`）：缓存 5 分钟
+- **网络信息**（`eth_chainId`、`net_version`、`web3_clientVersion`）：缓存 1 小时
+- **日志查询**（`eth_getLogs`）：缓存 1 分钟
+- **其他方法**：默认缓存 5 分钟
+
+> epoch（确认档位）按链配置：Ethereum 32 块、BSC 200 块、Polygon 64 块、Arbitrum 32 块、Optimism 16 块、Avalanche 32 块。
 
 #### 1.2 Cloudflare Workers 后端
 **功能描述**：处理压缩的 JSON-RPC 请求，提供智能缓存和参数管理

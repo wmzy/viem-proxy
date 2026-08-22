@@ -5,8 +5,31 @@
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
+    "smoke": "node scripts/smoke.mjs",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
+  },
+  "cloudflare": {
+    "bindings": {
+      "API_KEY": {
+        "description": "认证密钥。**不设置则任何人都能使用你部署的服务、消耗你的 RPC 配额**，建议用 `openssl rand -hex 32` 生成，客户端通过 `proxy.apiKey` 传入"
+      },
+      "RPC_URLS": {
+        "description": "JSON 映射 `chainId -> URL[]`（可配置多个上游实现故障转移），如 `{\"1\":[\"https://eth-mainnet.g.alchemy.com/v2/你的Key\"]}`。不设置时使用内置公共 RPC（限流严格，仅供试用）"
+      },
+      "ALLOWED_CHAIN_IDS": {
+        "description": "可选，可服务的链 ID 白名单，如 `\"1,137\"`；不设置则服务所有已配置上游 RPC 的链"
+      },
+      "MAX_RPC_CONCURRENCY": {
+        "description": "每条链允许的并发上游 RPC 调用数，默认 `10`；超出部分进入 FIFO 队列排队"
+      },
+      "RATE_LIMIT_PER_MINUTE": {
+        "description": "每 IP 每分钟请求预算，默认 `60`；设 `\"0\"` 禁用限流。超限返回 `429` + `Retry-After`；`/api/v1/stats` 与 `/api/v1/health` 豁免"
+      },
+      "ALLOWED_ORIGINS": {
+        "description": "可选，浏览器 Origin 白名单，逗号分隔，支持 `*.example.com` 通配（匹配主域及所有子域名；`scheme://` 前缀会被忽略、端口参与匹配）。不设置则不做 Origin 检查（默认宽松，配合 `API_KEY`/限流使用）。设置后：带 Origin 头的请求必须匹配白名单否则 `403`，且 CORS 只回显匹配的 Origin；不带 Origin 的服务端调用不受影响。`/dashboard` 运维页豁免"
+      }
+    }
   },
   "dependencies": {
     "hono": "^3.12.0"

@@ -64,6 +64,59 @@ const decompressFunctionSelectors = (data: string): string => {
   return result;
 };
 
+/** selector -> name view of FUNCTION_SELECTORS (compression is the inverse direction) */
+const SELECTOR_TO_FUNCTION: Record<string, string> = Object.fromEntries(
+  Object.entries(FUNCTION_SELECTORS).map(([name, selector]) => [selector, name])
+);
+
+const compressFunctionSelectors = (data: string): string => {
+  let result = data;
+  for (const [selector, name] of Object.entries(SELECTOR_TO_FUNCTION)) {
+    const regex = new RegExp(`"${selector}"`, "g");
+    result = result.replace(regex, `"${name}"`);
+  }
+  return result;
+};
+
+const compressZeroPadding = (data: string): string => {
+  return data.replace(/0{8,}/g, (match) => `{${match.length}z}`);
+};
+
+/**
+ * Compress a JSON params string into the `p=` query value of the cacheable
+ * GET URL, byte-for-byte the way the client library does
+ * (src/utils/compression.ts). The purge endpoint uses this to reconstruct
+ * the exact URL a cached entry lives under, so any divergence between the
+ * two implementations breaks cache deletion — the cross-package equality
+ * test in workers/test/handlers.test.ts guards the contract.
+ */
+export const compressParams = (params: string): string => {
+  let compressed = params;
+
+  try {
+    JSON.parse(params);
+
+    compressed = compressFunctionSelectors(compressed);
+    compressed = compressZeroPadding(compressed);
+
+    const base64Compressed = ENCODING_PREFIX_B64 +
+      btoa(compressed)
+        .replace(/\+/g, "-")
+        .replace(/\//g, "_")
+        .replace(/=/g, "");
+
+    const urlEncoded = ENCODING_PREFIX_URL + encodeURIComponent(compressed);
+
+    compressed = base64Compressed.length <= urlEncoded.length
+      ? base64Compressed
+      : urlEncoded;
+  } catch {
+    compressed = ENCODING_PREFIX_URL + encodeURIComponent(params);
+  }
+
+  return compressed;
+};
+
 const decompressZeroPadding = (data: string): string => {
   return data.replace(/\{(\d+)z\}/g, (_match, length) => {
     return "0".repeat(parseInt(length, 10));

@@ -6,7 +6,7 @@ import type {
 } from "./types";
 import type { CacheStatus, RequestStrategy, RpcRequest, RpcResponse } from "../types";
 import { compressParams } from "../utils/compression";
-import { getMetricsCollector, readCacheStatus } from "../utils/metrics";
+import { getSharedCollector, readCacheStatus } from "../utils/metrics";
 import { applyMiddlewareChain } from "./middleware";
 
 /** Requests slower than this (ms) get a debug warning carrying the trace id */
@@ -26,16 +26,96 @@ export const DEFAULT_PROXY_CONFIG: Required<ProxyActionConfig> = {
   retryOptions: { ...DEFAULT_RETRY_OPTIONS },
 };
 
+/** Reason category for a proxy failure that fell back to direct RPC */
+export type FallbackReason =
+  | "network"
+  | "timeout"
+  | "5xx"
+  | "429"
+  | "abort"
+  | "other";
+
 /**
  * Marker for transient failures worth retrying (network errors, timeouts,
  * 5xx and 429 responses). Any other error aborts the retry loop.
  * Exported so batch requests can reuse the same retry classification.
+ * `reason` tags the failure category at the send path so fallback
+ * metrics can classify without guessing from the message.
  */
-export class RetryableError extends Error {}
+export class RetryableError extends Error {
+  /** Failure category set where the failure is known precisely */
+  readonly reason?: FallbackReason;
+
+  constructor(
+    message: string,
+    options?: { cause?: unknown; reason?: FallbackReason }
+  ) {
+    super(
+      message,
+      options?.cause !== undefined ? { cause: options.cause } : undefined
+    );
+    if (options?.reason !== undefined) this.reason = options.reason;
+  }
+}
 
 /** HTTP statuses that are safe to retry: 429 and all 5xx */
 export const isRetryableStatus = (status: number | undefined): boolean =>
   status === 429 || (status !== undefined && status >= 500);
+
+/** Map a raw fetch() rejection to a fallback reason category */
+const fetchFailureReason = (error: unknown): FallbackReason => {
+  const name = error instanceof Error ? error.name : "";
+  if (name === "TimeoutError") return "timeout";
+  if (name === "AbortError") return "abort";
+  return "network";
+};
+
+/**
+ * Classify why a proxy failure fell back to direct RPC. Prefers the
+ * reason tag attached where the failure is known precisely
+ * (`RetryableError.reason` from the send path); falls back to message
+ * heuristics for errors raised elsewhere (middleware throws, proxy
+ * JSON errors, decode failures).
+ */
+export const classifyFallbackReason = (error: unknown): FallbackReason => {
+  if (error instanceof RetryableError && error.reason) return error.reason;
+  const message = error instanceof Error ? error.message : String(error);
+  const httpStatus = /^HTTP (\d{3})$/.exec(message);
+  if (httpStatus) {
+    const status = Number(httpStatus[1]);
+    if (status === 429) return "429";
+    if (status >= 500) return "5xx";
+  }
+  const lower = message.toLowerCase();
+  if (lower.includes("timed out") || lower.includes("timeout")) {
+    return "timeout";
+  }
+  if (lower.includes("abort")) return "abort";
+  if (
+    lower.includes("fetch") ||
+    lower.includes("network") ||
+    lower.includes("econnrefused") ||
+    lower.includes("enotfound") ||
+    lower.includes("socket")
+  ) {
+    return "network";
+  }
+  return "other";
+};
+
+/**
+ * Record that `method` fell back to the original RPC after the proxy
+ * call failed with `error`. Called from every action's fallback path —
+ * covering both requests whose retries were exhausted and requests that
+ * failed directly — so `getCacheStats()` exposes how often the proxy
+ * delivers no value, and why.
+ */
+export const recordFallback = (method: string, error: unknown): void => {
+  getSharedCollector().recordFallback({
+    method,
+    reason: classifyFallbackReason(error),
+  });
+};
 
 /** Generate a short random trace id (12 hex chars) for request correlation */
 export const generateTraceId = (): string => {
@@ -106,7 +186,7 @@ export const makeProxyRequest = async <T>(
   let lastCacheStatus: CacheStatus = "unknown";
   // Strategy of the most recent send: compressed for GET, direct for POST.
   let strategy: RequestStrategy = "direct";
-  const collector = getMetricsCollector();
+  const collector = getSharedCollector();
 
   // Core sender: performs the actual HTTP round trip for `request`. It is
   // a function of the request so the middleware chain can modify the
@@ -143,17 +223,22 @@ export const makeProxyRequest = async <T>(
           requestOptions
         );
       } catch (error) {
-        // Network or timeout failure: retry with the same trace id
+        // Network or timeout failure: retry with the same trace id.
+        // fetch() only rejects for network-level failures; classify by
+        // the underlying error name so fallback metrics can tell
+        // timeouts and aborts apart from unreachable hosts.
         throw new RetryableError(
           error instanceof Error ? error.message : String(error),
-          { cause: error }
+          { cause: error, reason: fetchFailureReason(error) }
         );
       }
 
       lastCacheStatus = readCacheStatus(response);
 
       if (isRetryableStatus(response.status)) {
-        throw new RetryableError(`HTTP ${response.status}`);
+        throw new RetryableError(`HTTP ${response.status}`, {
+          reason: response.status === 429 ? "429" : "5xx",
+        });
       }
 
       const data = (await response.json()) as

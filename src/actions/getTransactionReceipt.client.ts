@@ -1,7 +1,7 @@
 import type { Client, Chain, Transport, TransactionReceipt } from "viem";
 import { getTransactionReceipt as viemGetTransactionReceipt } from "viem/actions";
 import { getProxyConfig } from "../proxy";
-import { makeProxyRequest } from "./utils";
+import { makeProxyRequest, recordFallback } from "./utils";
 
 export type GetTransactionReceiptParameters = {
   hash: `0x${string}`;
@@ -33,6 +33,7 @@ export const getTransactionReceipt = async <TChain extends Chain | undefined>(
     return result;
   } catch (error) {
     if (proxy.fallback !== false) {
+      recordFallback("getTransactionReceipt", error);
       if (proxy.debug) {
         console.warn("[viem-proxy] Fallback to direct RPC:", error);
       }

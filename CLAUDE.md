@@ -88,8 +88,8 @@ Client → Proxy Action (*.client.ts) → Workers API → Action Handler (*.serv
 ```
 
 ### Usage Patterns
-1. **createPublicClient with proxy config**: Simple drop-in replacement; helper methods (`batch`, `getCacheStats`, `clearCache`, `preheatCache`, `use`) wired directly
-2. **client.extend(proxyActions())**: Recommended for tree-shaking. Caveat: viem's `extend` both type-rejects and runtime-strips the `batch` extension key (collides with viem's `batch` multicall config), so use `proxyActions(client).batch(...)` or `batchActions(requests, config)` for batching
+1. **createPublicClient with proxy config**: Simple drop-in replacement; helper methods (`batchProxy`, `getCacheStats`, `clearCache`, `preheatCache`, `use`) wired directly
+2. **client.extend(proxyActions())**: Recommended for tree-shaking. All proxy actions are available; the batch method is named `batchProxy` because viem's `extend` strips extension keys colliding with core client properties (`batch` is viem's multicall config key)
 3. **Standalone action import**: Best tree-shaking, import only what you need; attach the config with `withProxy(client, config)`
 
 ### Supported Methods (by Priority)

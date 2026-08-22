@@ -22,15 +22,29 @@ export type {
   BatchActionName,
   BatchRequest,
   BatchResult,
+  BatchResults,
   BatchItemError,
+  BatchActionParameters,
+  BatchActionReturnType,
 } from "./batch.client";
 
 // Cache preheat API
 export { preheatCache, preheatClientCache, PREHEAT_CONCURRENCY } from "./preheat.client";
 export type { PreheatRequest, PreheatResult } from "./preheat.client";
 
+// Cache purge API (standalone: no client instance involved)
+export { purgeCache } from "./purge.client";
+export type { PurgeRequest, PurgeResult } from "./purge.client";
+
 // Middleware API
 export { addMiddleware, clearMiddlewares, getMiddlewares } from "./middleware";
+
+// Global proxy configuration
+export {
+  configureProxy,
+  getProxyDefaults,
+  resetProxyDefaults,
+} from "./config";
 
 // Extend helper
 export { proxyActions } from "./proxyActions";

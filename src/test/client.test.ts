@@ -62,11 +62,10 @@ describe("Client", () => {
     it("should extend client with proxy methods", () => {
       const client = createPublicClient({ chain: CHAIN });
 
+      expect(client.batchProxy).toBeDefined();
       expect(client.getCacheStats).toBeDefined();
-      expect(client.clearCache).toBeDefined();
+      expect(client.resetStats).toBeDefined();
       expect(client.preheatCache).toBeDefined();
-      expect(client.getMetrics).toBeDefined();
-      expect(client.clearMetrics).toBeDefined();
     });
 
     it("should have proxied read methods when endpoint is set", () => {
@@ -124,6 +123,9 @@ describe("Client", () => {
         totalRequests: 0,
         errorCount: 0,
         errorRate: 0,
+        fallbackCount: 0,
+        fallbackRate: 0,
+        fallbackReasons: {},
         cacheHits: 0,
         cacheMisses: 0,
         cacheHitRate: 0,
@@ -137,8 +139,8 @@ describe("Client", () => {
       });
     });
 
-    it("should implement clearCache", () => {
-      expect(() => client.clearCache()).not.toThrow();
+    it("should implement resetStats", () => {
+      expect(() => client.resetStats()).not.toThrow();
     });
 
     it("should reflect proxy request metrics in getCacheStats", async () => {
@@ -161,7 +163,7 @@ describe("Client", () => {
       expect(stats.chainIds).toEqual([1]);
     });
 
-    it("should reset local metrics via clearCache", async () => {
+    it("should reset local metrics via resetStats", async () => {
       global.fetch = vi.fn().mockResolvedValueOnce({
         headers: new Headers({ "X-Cache": "MISS" }),
         json: () => Promise.resolve({ result: "0x1" }),
@@ -174,23 +176,11 @@ describe("Client", () => {
       await proxied.getBalance({ address: "0x1234567890123456789012345678901234567890" });
       expect(proxied.getCacheStats().totalRequests).toBe(1);
 
-      proxied.clearCache();
+      proxied.resetStats();
 
       const stats = proxied.getCacheStats();
       expect(stats.totalRequests).toBe(0);
       expect(stats.methodStats).toEqual({});
-    });
-
-    it("should implement getMetrics", async () => {
-      const metrics = await client.getMetrics();
-
-      expect(metrics.totalRequests).toBe(0);
-      expect(metrics.cacheHitRate).toBe(0);
-    });
-
-    it("should implement clearMetrics", async () => {
-      const result = await client.clearMetrics();
-      expect(result).toBe(true);
     });
 
     it("should implement preheatCache returning zero counters when no endpoint", async () => {
@@ -200,42 +190,58 @@ describe("Client", () => {
 
       expect(result).toEqual({ submitted: 0, failed: 0 });
     });
+
+    it("should implement batchProxy through the extend path", async () => {
+      // With an endpoint set, the client goes through viem's
+      // `extend(proxyActions)` — `batchProxy` must survive viem's
+      // stripping of extension keys that collide with core client
+      // properties (`batch` does collide, `batchProxy` must not).
+      const fetchMock = vi.fn().mockResolvedValueOnce({
+        headers: new Headers({ "X-Cache": "MISS" }),
+        json: () => Promise.resolve({ results: [{ id: 1, result: "0x9" }] }),
+      });
+      global.fetch = fetchMock;
+
+      const proxied = createPublicClient({
+        chain: CHAIN,
+        proxy: { endpoint: "https://proxy.example.com", retryOptions: { attempts: 1, delay: 0 } },
+      });
+
+      expect(typeof proxied.batchProxy).toBe("function");
+
+      const results = await proxied.batchProxy([{ id: 1, action: "getGasPrice" }]);
+
+      // Wire hex quantities are decoded, so getGasPrice returns bigint
+      expect(results).toEqual([{ id: 1, result: BigInt("0x9") }]);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+      expect(url).toBe("https://proxy.example.com/api/v1/batch");
+      expect(init.method).toBe("POST");
+    });
   });
 
   describe("debug mode logging", () => {
-    it("should log on clearCache when debug is enabled", () => {
+    it("should log on resetStats when debug is enabled", () => {
       const spy = vi.spyOn(console, "log").mockImplementation(() => {});
       const client = createPublicClient({
         chain: CHAIN,
         proxy: { debug: true },
       });
 
-      client.clearCache();
-      expect(spy).toHaveBeenCalledWith("[viem-proxy] Cache cleared");
+      client.resetStats();
+      expect(spy).toHaveBeenCalledWith("[viem-proxy] Stats reset");
       spy.mockRestore();
     });
 
-    it("should not log on clearCache when debug is disabled", () => {
+    it("should not log on resetStats when debug is disabled", () => {
       const spy = vi.spyOn(console, "log").mockImplementation(() => {});
       const client = createPublicClient({
         chain: CHAIN,
         proxy: { debug: false },
       });
 
-      client.clearCache();
-      expect(spy).not.toHaveBeenCalledWith("[viem-proxy] Cache cleared");
-      spy.mockRestore();
-    });
-
-    it("should log on clearMetrics when debug is enabled", async () => {
-      const spy = vi.spyOn(console, "log").mockImplementation(() => {});
-      const client = createPublicClient({
-        chain: CHAIN,
-        proxy: { debug: true },
-      });
-
-      await client.clearMetrics();
-      expect(spy).toHaveBeenCalledWith("[viem-proxy] Metrics cleared");
+      client.resetStats();
+      expect(spy).not.toHaveBeenCalledWith("[viem-proxy] Stats reset");
       spy.mockRestore();
     });
   });

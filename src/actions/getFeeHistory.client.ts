@@ -1,7 +1,7 @@
 import type { Client, Chain, Transport } from "viem";
 import { getFeeHistory as viemGetFeeHistory } from "viem/actions";
 import { getProxyConfig } from "../proxy";
-import { makeProxyRequest } from "./utils";
+import { makeProxyRequest, recordFallback } from "./utils";
 
 export type GetFeeHistoryParameters = {
   blockCount: number;
@@ -18,15 +18,16 @@ export type GetFeeHistoryReturnType = {
 };
 
 /** Raw eth_feeHistory payload (hex quantities) as returned upstream */
-type RpcFeeHistory = {
+export type RpcFeeHistory = {
   oldestBlock: string;
   baseFeePerGas: string[];
   gasUsedRatio: number[];
   reward?: string[][];
 };
 
-/** Convert the raw RPC payload to viem's bigint-based fee history shape */
-const formatFeeHistory = (history: RpcFeeHistory): GetFeeHistoryReturnType => ({
+/** Convert the raw RPC payload to viem's bigint-based fee history shape.
+ * Exported for the batch path, which normalizes its items the same way. */
+export const formatFeeHistory = (history: RpcFeeHistory): GetFeeHistoryReturnType => ({
   baseFeePerGas: history.baseFeePerGas.map((fee) => BigInt(fee)),
   gasUsedRatio: history.gasUsedRatio,
   oldestBlock: BigInt(history.oldestBlock),
@@ -64,6 +65,7 @@ export const getFeeHistory = async <TChain extends Chain | undefined>(
     return formatFeeHistory(result);
   } catch (error) {
     if (proxy.fallback !== false) {
+      recordFallback("getFeeHistory", error);
       if (proxy.debug) {
         console.warn("[viem-proxy] Fallback to direct RPC:", error);
       }

@@ -1,5 +1,9 @@
 import type { Chain, Transport, PublicClient } from "viem";
-import type { BatchRequest, BatchResult } from "./actions/batch.client";
+import type {
+  BatchRequest,
+  BatchRequests,
+  BatchResults,
+} from "./actions/batch.client";
 import type { PreheatRequest, PreheatResult } from "./actions/preheat.client";
 
 export type ProxyConfig = {
@@ -90,22 +94,29 @@ export type ProxyPublicClient<
   /**
    * Execute multiple actions in one batch request against the proxy
    * (POST /api/v1/batch). Items are isolated per-entry; without a proxy
-   * config items run through the native actions. Note: this property
-   * overrides viem's `batch` multicall config flag on the client.
+   * config items run through the native actions. Named `batchProxy`
+   * because viem clients already carry a `batch` multicall config
+   * property, and viem's `extend` strips extension keys that collide
+   * with core client properties — `batchProxy` is therefore the one
+   * name that survives every usage pattern, extend mode included.
    */
-  batch: (requests: BatchRequest[]) => Promise<BatchResult[]>;
+  batchProxy: <const T extends readonly BatchRequest[]>(
+    requests: T & BatchRequests<T>
+  ) => Promise<BatchResults<T>>;
   /**
    * Snapshot of locally collected performance metrics: request counts,
-   * cache hit rate, error rate and response-time percentiles (P50/P95/P99),
-   * with a per-method breakdown.
+   * cache hit rate, error rate, response-time percentiles (P50/P95/P99)
+   * and fallback observability (fallbackCount / fallbackRate /
+   * fallbackReasons — a fallback means the proxy delivered no value for
+   * that request), with a per-method breakdown.
    */
   getCacheStats: () => PerformanceMetrics;
   /**
    * Reset the locally collected metrics. This only clears client-side
-   * statistics — purging the CDN cache itself requires server-side
-   * support and will be provided in a later version.
+   * statistics — it does not purge the CDN cache, which requires
+   * server-side support and will be provided in a later version.
    */
-  clearCache: () => void;
+  resetStats: () => void;
   /**
    * Preheat the CDN cache for the given requests. Each item fires through
    * the regular compressed GET path in a bounded pool (5 concurrent), so
@@ -120,8 +131,6 @@ export type ProxyPublicClient<
    * fallback/error path.
    */
   use: (middleware: ProxyMiddleware) => void;
-  getMetrics: () => Promise<PerformanceMetrics>;
-  clearMetrics: () => Promise<boolean>;
 };
 
 export type ProxyMiddleware = (
@@ -172,6 +181,8 @@ export type MethodMetrics = {
   count: number;
   errorCount: number;
   errorRate: number;
+  /** Requests of this method that fell back to the original RPC */
+  fallbackCount: number;
   cacheHits: number;
   cacheMisses: number;
   cacheHitRate: number;
@@ -185,6 +196,24 @@ export type PerformanceMetrics = {
   totalRequests: number;
   errorCount: number;
   errorRate: number;
+  /**
+   * Proxy requests that failed and fell back to the original RPC. A
+   * fallback means the proxy delivered no value for that request (the
+   * answer came from the RPC provider directly), so this — not the
+   * error rate — is the key metric for whether the proxy is actually
+   * being used: a sustained high fallback count means traffic is
+   * silently bypassing the proxy.
+   */
+  fallbackCount: number;
+  /** `fallbackCount / totalRequests`; 0 when no requests were recorded */
+  fallbackRate: number;
+  /**
+   * Fallback counts by failure reason: `"network"` (fetch rejected,
+   * proxy unreachable), `"timeout"` (request timed out), `"5xx"`,
+   * `"429"` (rate limited), `"abort"`, `"other"` (proxy-level or
+   * middleware errors). Only reasons that actually occurred appear.
+   */
+  fallbackReasons: Record<string, number>;
   cacheHits: number;
   cacheMisses: number;
   cacheHitRate: number;

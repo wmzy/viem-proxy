@@ -1,7 +1,7 @@
 import type { Client, Chain, Transport } from "viem";
 import { estimateGas as viemEstimateGas } from "viem/actions";
 import { getProxyConfig } from "../proxy";
-import { makeProxyRequest } from "./utils";
+import { makeProxyRequest, recordFallback } from "./utils";
 
 export type EstimateGasParameters = {
   to?: `0x${string}`;
@@ -13,6 +13,13 @@ export type EstimateGasParameters = {
 };
 
 export type EstimateGasReturnType = bigint;
+
+/**
+ * Decode a raw `eth_estimateGas` hex quantity. Shared with the batch
+ * path so both return the same viem value for the same wire value.
+ */
+export const decodeEstimateGasResult = (result: string): bigint =>
+  BigInt(result);
 
 /**
  * Estimate gas through proxy
@@ -47,9 +54,10 @@ export const estimateGas = async <TChain extends Chain | undefined>(
       },
       proxy
     );
-    return BigInt(result);
+    return decodeEstimateGasResult(result);
   } catch (error) {
     if (proxy.fallback !== false) {
+      recordFallback("estimateGas", error);
       if (proxy.debug) {
         console.warn("[viem-proxy] Fallback to direct RPC:", error);
       }

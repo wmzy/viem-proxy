@@ -147,6 +147,28 @@ const client = createPublicClient({
 })
 ```
 
+#### 全局默认（configureProxy）
+
+endpoint 等配置需要在多处使用时，用 `configureProxy` 设置**模块级默认**，一次设置、全入口继承（`createPublicClient`、`withProxy`、`proxyActions`、`batchActions`、`preheatCache`、`purgeCache`）：
+
+```typescript
+import { configureProxy } from 'viem-proxy'
+
+configureProxy({
+  endpoint: 'https://your-workers-domain.workers.dev',
+  timeout: 10000,
+  fallback: true
+})
+
+// 之后无需再重复传 endpoint / timeout
+const client = createPublicClient({ chain: mainnet, transport: http() })
+const results = await batchActions([{ id: 1, action: 'getBlockNumber' }])  // config 可省略
+```
+
+优先级：显式传入的配置 > 客户端挂载的配置 > 模块默认 > 内置默认（逐键比较）。
+模块默认是**进程级**状态，SSR / 多实例共享；需要隔离时用显式传参（永远优先）。
+详见 README「客户端配置 → 全局默认配置」。
+
 ### 进阶能力
 
 #### 1. 指标采集
@@ -167,23 +189,39 @@ await client.getBalance({ address: '0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045' 
 const stats = client.getCacheStats()
 console.log(`命中率: ${(stats.cacheHitRate * 100).toFixed(1)}%, P95: ${stats.responseTimeP95}ms`)
 
-// 重置本地统计
-client.clearCache()
+// 回退观测：回退意味着该次请求绕过了代理（代理未产生价值）
+// fallbackCount：回退次数；fallbackRate：fallbackCount / totalRequests
+// fallbackReasons：按原因分类（network / timeout / 5xx / 429 / abort / other）
+if (stats.fallbackRate > 0.05) {
+  console.warn('回退率超过 5%，检查代理可达性或限流配置:', stats.fallbackReasons)
+}
+
+// 重置本地统计（仅清空客户端指标，与 CDN 缓存无关）
+client.resetStats()
 ```
 
 #### 2. 批量请求
 
 ```typescript
 // 单次 POST /api/v1/batch 往返；单项隔离，失败项返回 error，其余照常
-const results = await client.batch([
+// （方法名 batchProxy：避开 viem 客户端自身的 batch 配置属性，
+//   createPublicClient 与 extend 模式下均可用）
+const results = await client.batchProxy([
   { id: 1, action: 'getBalance', args: { address: '0xd8dA...' } },
   { id: 2, action: 'getBlockNumber' },
-  { id: 3, action: 'getGasPrice', chainId: 137 }  // 可按项覆盖目标链
+  { id: 3, action: 'getChainId', chainId: 137 }  // 可按项覆盖目标链
 ])
+
+// 每项 result 类型按该项 action 自动推断（与对应单项 action 的
+// 返回类型一致，无需 `as unknown` / 手动断言）：
+//   results[0].result: bigint | undefined  ← getBalance
+//   results[1].result: bigint | undefined  ← getBlockNumber
+//   results[2].result: number | undefined  ← getChainId
+const balance: bigint | undefined = results[0].result
 
 for (const item of results) {
   if (item.error) console.error(`#${item.id} 失败:`, item.error.message)
-  else console.log(`#${item.id}:`, item.result)
+  else console.log(`#${item.id}:`, item.result)  // 联合类型，按索引访问可得精确类型
 }
 ```
 
@@ -212,8 +250,10 @@ client.use(async (request, next) => {
 ```
 
 > 以上扩展方法依赖客户端实例；单独 actions 导入时可改用顶层函数
-> `batchActions(requests, config, chainId?)`、`preheatCache(requests, config?, chainId?)`、
-> `addMiddleware(fn)`（均从 `viem-proxy/actions` 导入）。
+> `batchActions(requests, config?, chainId?)`、`preheatCache(requests, config?, chainId?)`、
+> `addMiddleware(fn)`（均从 `viem-proxy/actions` 导入；config 省略时继承 `configureProxy` 模块默认）。
+>
+> 预热集合怎么自动收集？Next.js 路由预取场景的落地示例见 [`examples/nextjs-preheat/`](examples/nextjs-preheat/)。
 
 #### 5. 服务端统计
 
@@ -224,6 +264,20 @@ client.use(async (request, next) => {
 curl 'https://your-workers-domain.workers.dev/api/v1/stats?chainId=1&hours=24'
 # → { totalRequests, cacheHits, cacheHitRate, averageResponseTime,
 #     errorCount, errorRate, periods: [{ bucket, count, errorCount, p50, p95, p99 }] }
+```
+
+#### 6. 缓存清除
+
+服务端管理端点 `POST /api/v1/purge` 主动失效缓存（需要 `API_KEY` 鉴权、不豁免限流；未配置密钥时返回 501）。支持整链（`{ "chainId": 1 }`）与单请求（`{ "requests": [...] }`）两种粒度。如实说明的限制：只影响处理该请求的 **colo**（`scope: "colo"`），不是全局 CDN 失效；链级清除无法枚举 CDN 条目，只清 Durable Object 去重存储。详见 README「缓存清除」。
+
+```typescript
+import { purgeCache } from 'viem-proxy/actions'
+
+const report = await purgeCache(
+  [{ chainId: 1, action: 'getBalance', args: { address: '0xd8dA...' } }],
+  { endpoint: 'https://your-workers-domain.workers.dev', apiKey: '你的API_KEY' }
+)
+// report: { purged: { dedup, cache }, scope: 'colo', limitations: [...] }
 ```
 
 ## 🌐 部署 Cloudflare Workers
@@ -244,6 +298,11 @@ class_name = "ProxyState"
 name = "STATISTICS"
 class_name = "Statistics"
 
+# 每 IP 限流（保护你的 RPC 配额不被滥用）
+[[durable_objects.bindings]]
+name = "RATE_LIMITER"
+class_name = "RateLimiter"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["ProxyState"]
@@ -252,10 +311,17 @@ new_sqlite_classes = ["ProxyState"]
 tag = "v2"
 new_sqlite_classes = ["Statistics"]
 
+[[migrations]]
+tag = "v3"
+new_sqlite_classes = ["RateLimiter"]
+
 [vars]
 ENVIRONMENT = "production"
 MAX_RPC_CONCURRENCY = "10"  # 每条链允许的并发上游 RPC 调用数
+RATE_LIMIT_PER_MINUTE = "60"  # 每 IP 每分钟请求预算（"0" 禁用；/api/v1/stats 与 /api/v1/health 豁免）
 ```
+
+> 默认开启按 IP 限流（固定 60 秒窗口，Durable Object 全局计数）：超限返回 `429` + `Retry-After`，不计入成功统计。`"0"` 可整体禁用。详见 README「限流（滥用防护）」。
 
 ### 2. 部署
 
@@ -263,6 +329,50 @@ MAX_RPC_CONCURRENCY = "10"  # 每条链允许的并发上游 RPC 调用数
 cd workers
 npm run deploy
 ```
+
+### 3. 验证部署
+
+部署完成后访问健康检查端点确认服务状态（无需 `X-API-Key`）：
+
+```bash
+curl 'https://your-workers-domain.workers.dev/api/v1/health'
+# → { "status": "ok", "version": "0.2.0", "environment": "production",
+#     "chains": [{ "chainId": 1, "upstreams": 3 }, ...],
+#     "durableObjects": { "proxyState": true, "statistics": true },
+#     "rateLimit": { "enabled": true, "limitPerMinute": 60 } }
+```
+
+`status` 为 `"ok"` 即部署成功；`"degraded"` 表示无可服务的链（检查 `RPC_URLS`/`ALLOWED_CHAIN_IDS` 配置）。需要进一步验证上游连通性时加 `?deep=1`（最多探测 5 条链，各 2.5 秒超时；会消耗上游配额，仅排障时用）。详见 README「健康检查端点」。
+
+curl 之外，也可以直接在浏览器打开 `https://your-workers-domain.workers.dev/dashboard`——内嵌统计仪表盘（汇总卡片 + 分桶时序图，支持 24h/7d 切换与 chainId/method 过滤）图形化展示 `/api/v1/stats` 的数据，便于部署后快速目检流量是否正常（页面本身无需鉴权；数据仍走 `/api/v1/stats` 的鉴权规则，配置了 `API_KEY` 时在页面内填入即可）。
+
+### 4. 部署后验证（冒烟脚本）
+
+用仓库自带的冒烟脚本在 1 分钟内确认代理工作正常（Node ≥ 18，零依赖）：
+
+```bash
+# 仓库根目录执行；也可 cd workers && pnpm smoke <endpoint> ...
+node workers/scripts/smoke.mjs https://your-proxy.workers.dev --chain 1 --key 你的API_KEY
+```
+
+脚本依次检查：① 健康检查 `GET /api/v1/health`（旧版本无此端点时自动跳过）；② 连续 3 次 `getBlockNumber`（每次延迟 + `X-Cache` 命中 + trace id，重复请求应命中去重缓存）；③ `getBalance`；④ 可选的 `GET /api/v1/stats` 服务端统计。末尾输出 ✅/❌ 总结，任一关键请求失败时退出码非零，适合接入部署钩子。完整示例输出与选项说明见 README「部署后验证」小节和 `node workers/scripts/smoke.mjs --help`。
+
+### 5. 性能基准（可选）
+
+验证代理工作正常后，用仓库根目录的基准脚本量化「直连上游 RPC」与「走代理」的延迟差距（Node ≥ 18，零依赖）：
+
+```bash
+# 仓库根目录执行；--proxy 是你的 Workers 端点，--rpc 是直连对照的上游 RPC
+node scripts/benchmark.mjs \
+  --proxy https://your-proxy.workers.dev \
+  --rpc https://eth.llamarpc.com \
+  --key 你的API_KEY
+
+# 等价别名
+pnpm benchmark --proxy https://your-proxy.workers.dev --rpc https://eth.llamarpc.com --key 你的API_KEY
+```
+
+三个场景（`getBalance` / `getBlockNumber` / `readContract`）逐次计时，输出中文报告：每路径 P50/P95/P99/均值、`X-Cache` 命中率、首次（冷）vs 后续延迟、上游 RPC 调用节省估算；`--json` 输出机器可读结果。加 `--help` 查看全部选项。用法解读与示例输出见 README「📊 性能对比」章节。
 
 ## 🧪 开发和测试
 

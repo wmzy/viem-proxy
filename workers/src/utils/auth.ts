@@ -1,4 +1,21 @@
 /**
+ * API paths served without the X-API-Key check. These carry no secrets and
+ * exist so deployers and uptime monitors can probe the service (e.g. the
+ * health endpoint). Auth-free by design, but rate-limit middlewares should
+ * consult the same set so the exemption lists cannot drift apart.
+ *
+ * `/dashboard` is the monitoring UI shell: the document itself carries no
+ * data (all numbers are fetched browser-side through /api/v1/stats, which
+ * keeps its own auth rules). It is also outside the /api/* scope this
+ * middleware guards, so the entry is defensive registration — a registry
+ * of read-only monitoring surfaces, not the operative exemption.
+ */
+export const PUBLIC_API_PATHS = new Set<string>([
+  "/api/v1/health",
+  "/dashboard",
+]);
+
+/**
  * Constant-time string equality for secret comparison (API keys).
  *
  * A naive `provided === expected` short-circuits on the first mismatching

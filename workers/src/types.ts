@@ -1,9 +1,11 @@
 import type { ProxyState } from "./durable-objects/proxy-state";
+import type { RateLimiter } from "./durable-objects/rate-limiter";
 import type { Statistics } from "./durable-objects/statistics";
 
 export type Env = {
   PROXY_STATE: DurableObjectNamespace<ProxyState>;
   STATISTICS: DurableObjectNamespace<Statistics>;
+  RATE_LIMITER: DurableObjectNamespace<RateLimiter>;
   ENVIRONMENT: string;
   MAX_CACHE_TTL: string;
   DEFAULT_CACHE_TTL: string;
@@ -18,6 +20,21 @@ export type Env = {
   ALLOWED_CHAIN_IDS?: string;
   /** Per-chain upstream RPC concurrency cap (default 10) */
   MAX_RPC_CONCURRENCY?: string;
+  /**
+   * Per-IP rate limit in requests/minute (default 60; "0" disables).
+   * Enforced by the rate-limit middleware; reported by /api/v1/health.
+   */
+  RATE_LIMIT_PER_MINUTE?: string;
+  /**
+   * Optional comma-separated allowlist of browser origins, with
+   * `*.example.com` wildcards, e.g. "app.example.com,*.dapp.dev".
+   * Entries are hosts: `scheme://` prefixes are stripped, ports are
+   * honored. Unset = permissive (no Origin check; pair with API_KEY and
+   * rate limiting). When set, requests carrying an Origin header must
+   * match the allowlist or are rejected with 403; requests without Origin
+   * (server-side callers) pass. `/dashboard` is exempt.
+   */
+  ALLOWED_ORIGINS?: string;
 };
 
 /**

@@ -189,6 +189,45 @@ export class ProxyState extends DurableObject<Env> {
   }
 
   /**
+   * Delete one request record by hash (cache purge). Returns whether a row
+   * actually existed — purge reports count on it. Unlike the read path, no
+   * freshness filter: a purge of a stale-but-present row is still a delete.
+   */
+  async deleteRequest(requestHash: string): Promise<boolean> {
+    await this.ensureInitialized();
+
+    const existing = this.ctx.storage.sql.exec(
+      `SELECT 1 FROM pending_requests WHERE request_hash = ?`,
+      requestHash
+    );
+    if ([...existing].length === 0) return false;
+
+    this.ctx.storage.sql.exec(
+      `DELETE FROM pending_requests WHERE request_hash = ?`,
+      requestHash
+    );
+    return true;
+  }
+
+  /**
+   * Delete every request record stored in this instance. One ProxyState
+   * instance serves one chain (`chain-${chainId}` name), so this is the
+   * chain-level purge; returns how many rows were deleted.
+   */
+  async purgeAllRequests(): Promise<number> {
+    await this.ensureInitialized();
+
+    const counted = this.ctx.storage.sql.exec<{ count: number }>(
+      `SELECT COUNT(*) AS count FROM pending_requests`
+    );
+    const rows = [...counted];
+    const count = rows[0]?.count ?? 0;
+
+    this.ctx.storage.sql.exec(`DELETE FROM pending_requests`);
+    return count;
+  }
+
+  /**
    * Handle HTTP requests to the Durable Object
    */
   async fetch(request: Request): Promise<Response> {
@@ -198,6 +237,23 @@ export class ProxyState extends DurableObject<Env> {
     const path = url.pathname;
 
     try {
+      // Purge every record in this instance (chain-level): POST /purge
+      if (request.method === "POST" && path === "/purge") {
+        const deleted = await this.purgeAllRequests();
+        return new Response(JSON.stringify({ deleted }), {
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+
+      // Purge one request record: DELETE /requests/:hash
+      if (request.method === "DELETE" && path.startsWith("/requests/")) {
+        const requestHash = path.split("/")[2];
+        const deleted = await this.deleteRequest(requestHash);
+        return new Response(JSON.stringify({ deleted }), {
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+
       // Check/create pending request: POST /requests
       if (request.method === "POST" && path === "/requests") {
         const { requestHash } = await request.json<{ requestHash: string }>();

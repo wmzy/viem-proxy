@@ -1,6 +1,7 @@
 import type { Chain, Client, Transport } from "viem";
 import { getProxyConfig } from "../proxy";
 import type { ProxyActionConfig } from "./types";
+import { getProxyDefaults, resolveProxyConfig } from "./config";
 import type { BatchActionName } from "./batch.client";
 import { makeProxyRequest } from "./utils";
 
@@ -47,17 +48,24 @@ const PREHEAT_RETRY_OPTIONS = { attempts: 1, delay: 0 };
  */
 export const preheatCache = async (
   requests: PreheatRequest[],
-  config?: ProxyActionConfig,
+  config?: Partial<ProxyActionConfig>,
   defaultChainId = 1
 ): Promise<PreheatResult> => {
-  if (requests.length === 0 || !config?.endpoint) {
+  const resolved = resolveProxyConfig(config);
+
+  if (requests.length === 0 || !resolved.endpoint) {
     return { submitted: 0, failed: 0 };
   }
 
-  const preheatConfig: ProxyActionConfig = {
-    ...config,
-    retryOptions: config.retryOptions ?? PREHEAT_RETRY_OPTIONS,
-  };
+  // Preheat stays single-attempt unless retryOptions come from the
+  // explicit config or the module defaults — the built-in default of
+  // 3 attempts does not apply here (re-issuing a failed preheat only
+  // adds upstream load).
+  const retryOptions =
+    config?.retryOptions ??
+    getProxyDefaults().retryOptions ??
+    PREHEAT_RETRY_OPTIONS;
+  const preheatConfig: ProxyActionConfig = { ...resolved, retryOptions };
 
   let failed = 0;
   let cursor = 0;

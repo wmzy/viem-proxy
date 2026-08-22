@@ -13,6 +13,11 @@ class_name = "ProxyState"
 name = "STATISTICS"
 class_name = "Statistics"
 
+# Per-IP rate limiter DO (protects your RPC quota from abuse)
+[[durable_objects.bindings]]
+name = "RATE_LIMITER"
+class_name = "RateLimiter"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["ProxyState"]
@@ -21,6 +26,10 @@ new_sqlite_classes = ["ProxyState"]
 tag = "v2"
 new_sqlite_classes = ["Statistics"]
 
+[[migrations]]
+tag = "v3"
+new_sqlite_classes = ["RateLimiter"]
+
 [vars]
 ENVIRONMENT = "production"
 MAX_CACHE_TTL = "31536000"
@@ -28,9 +37,19 @@ DEFAULT_CACHE_TTL = "300"
 COMPRESSION_THRESHOLD = "1500"
 FINALIZED_BLOCK_CACHE_TTL = "2592000"  # 30 days (30*24*3600)
 MAX_RPC_CONCURRENCY = "10"  # concurrent upstream RPC calls allowed per chain; excess requests wait in a FIFO queue (fail after 10s)
+# RATE_LIMIT_PER_MINUTE = "60"  # Per-IP request budget per minute on /api/v1/* ("0" disables).
+#   Read-only monitoring endpoints (/api/v1/stats, /api/v1/health) are exempt.
 # Batch endpoint cap is the compile-time constant MAX_BATCH_SIZE (50 items) in workers/src/handlers/batch.ts
 # API_KEY = ""  # Set via `wrangler secret put API_KEY` for authentication
 # RPC_URLS = '{"1":["https://eth.llamarpc.com"]}'  # JSON map of chainId -> URL[]
 # ALLOWED_CHAIN_IDS = "1,137"  # Optional comma-separated allowlist of servable chain IDs.
 #   When unset (default), every chain with a configured upstream RPC URL is allowed
 #   (the union of the built-in DEFAULT_RPC_URLS chains and any RPC_URLS entries).
+# ALLOWED_ORIGINS = "app.example.com,*.dapp.example.com"  # Optional origin allowlist for browser callers.
+#   Unset (default) = permissive: no Origin check (pair with API_KEY/rate limiting).
+#   When set: requests carrying an Origin header must match (exact host or wildcard
+#   subdomains; "scheme://" prefixes are stripped, ports are honored) or get 403;
+#   requests without Origin (server-side callers) are unaffected. Non-matching
+#   origins also get no Access-Control-Allow-Origin echo (preflights fail).
+#   The /dashboard operator page is exempt; to embed dashboards from another
+#   domain, add that domain here.

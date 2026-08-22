@@ -1,6 +1,13 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { makeProxyRequest, mergeProxyConfig, isProxyEnabled, DEFAULT_PROXY_CONFIG } from "../actions/utils";
-import { createMetricsCollector, getMetricsCollector, resetMetrics } from "../utils/metrics";
+import {
+  makeProxyRequest,
+  mergeProxyConfig,
+  isProxyEnabled,
+  DEFAULT_PROXY_CONFIG,
+  classifyFallbackReason,
+  RetryableError,
+} from "../actions/utils";
+import { createMetricsCollector, getSharedCollector, resetMetrics } from "../utils/metrics";
 
 const originalFetch = global.fetch;
 
@@ -376,7 +383,7 @@ describe("Action Utils", () => {
         endpoint: "https://proxy.example.com",
       });
 
-      const snapshot = getMetricsCollector().getSnapshot();
+      const snapshot = getSharedCollector().getSnapshot();
       expect(snapshot.totalRequests).toBe(1);
       expect(snapshot.errorCount).toBe(0);
       expect(snapshot.cacheHits).toBe(1);
@@ -405,7 +412,7 @@ describe("Action Utils", () => {
       // excluded from both hit and miss counters
       await makeProxyRequest("getBalance", 1, { address: "0x456" }, config);
 
-      const snapshot = getMetricsCollector().getSnapshot();
+      const snapshot = getSharedCollector().getSnapshot();
       expect(snapshot.totalRequests).toBe(2);
       expect(snapshot.cacheMisses).toBe(1);
       expect(snapshot.cacheHits).toBe(0);
@@ -426,7 +433,7 @@ describe("Action Utils", () => {
         })
       ).rejects.toThrow("Proxy error: execution reverted");
 
-      const snapshot = getMetricsCollector().getSnapshot();
+      const snapshot = getSharedCollector().getSnapshot();
       expect(snapshot.totalRequests).toBe(1);
       expect(snapshot.errorCount).toBe(1);
       expect(snapshot.errorRate).toBe(1);
@@ -558,6 +565,33 @@ describe("Action Utils", () => {
     });
   });
 
+  describe("classifyFallbackReason", () => {
+    it("should prefer the reason tag attached to RetryableError", () => {
+      expect(classifyFallbackReason(new RetryableError("HTTP 502", { reason: "5xx" }))).toBe("5xx");
+      expect(classifyFallbackReason(new RetryableError("HTTP 429", { reason: "429" }))).toBe("429");
+      expect(classifyFallbackReason(new RetryableError("fetch failed", { reason: "network" }))).toBe("network");
+      expect(classifyFallbackReason(new RetryableError("Signal timed out", { reason: "timeout" }))).toBe("timeout");
+      // Tag wins over message heuristics
+      const misleading = new RetryableError("timeout-ish wording", { reason: "abort" });
+      expect(classifyFallbackReason(misleading)).toBe("abort");
+    });
+
+    it("should fall back to message heuristics for untagged errors", () => {
+      expect(classifyFallbackReason(new Error("HTTP 503"))).toBe("5xx");
+      expect(classifyFallbackReason(new Error("HTTP 429"))).toBe("429");
+      expect(classifyFallbackReason(new Error("The operation was aborted"))).toBe("abort");
+      expect(classifyFallbackReason(new Error("Signal timed out"))).toBe("timeout");
+      expect(classifyFallbackReason(new Error("fetch failed"))).toBe("network");
+      expect(classifyFallbackReason(new Error("getaddrinfo ENOTFOUND proxy.example.com"))).toBe("network");
+    });
+
+    it("should classify proxy business and middleware errors as other", () => {
+      expect(classifyFallbackReason(new Error("Proxy error: execution reverted"))).toBe("other");
+      expect(classifyFallbackReason(new Error("middleware rejected the request"))).toBe("other");
+      expect(classifyFallbackReason("not even an error")).toBe("other");
+    });
+  });
+
   describe("MetricsCollector", () => {
     it("should return an all-zero snapshot when empty", () => {
       const snapshot = createMetricsCollector().getSnapshot();
@@ -566,6 +600,9 @@ describe("Action Utils", () => {
         totalRequests: 0,
         errorCount: 0,
         errorRate: 0,
+        fallbackCount: 0,
+        fallbackRate: 0,
+        fallbackReasons: {},
         cacheHits: 0,
         cacheMisses: 0,
         cacheHitRate: 0,
@@ -601,6 +638,7 @@ describe("Action Utils", () => {
         count: 2,
         errorCount: 1,
         errorRate: 0.5,
+        fallbackCount: 0,
         cacheHits: 1,
         cacheMisses: 1,
         cacheHitRate: 0.5,
@@ -614,6 +652,48 @@ describe("Action Utils", () => {
       expect(snapshot.methodStats.getBlock.cacheHits).toBe(0);
       expect(snapshot.methodStats.getBlock.cacheMisses).toBe(0);
       expect(snapshot.methodStats.getBlock.cacheHitRate).toBe(0);
+    });
+
+    it("should record fallback events with per-reason and per-method counts", () => {
+      const collector = createMetricsCollector();
+      collector.record({ method: "getBalance", chainId: 1, strategy: "compressed", success: false, responseTime: 10, cacheStatus: "unknown", error: "HTTP 502" });
+      collector.recordFallback({ method: "getBalance", reason: "5xx" });
+      collector.record({ method: "getBalance", chainId: 1, strategy: "compressed", success: false, responseTime: 20, cacheStatus: "unknown", error: "fetch failed" });
+      collector.recordFallback({ method: "getBalance", reason: "network" });
+      collector.recordFallback({ method: "getBalance", reason: "network" });
+      collector.record({ method: "getBlock", chainId: 1, strategy: "direct", success: true, responseTime: 30, cacheStatus: "hit" });
+
+      const snapshot = collector.getSnapshot();
+      expect(snapshot.totalRequests).toBe(3);
+      expect(snapshot.fallbackCount).toBe(3);
+      expect(snapshot.fallbackRate).toBe(1);
+      expect(snapshot.fallbackReasons).toEqual({ "5xx": 1, network: 2 });
+      expect(snapshot.methodStats.getBalance.fallbackCount).toBe(3);
+      expect(snapshot.methodStats.getBlock.fallbackCount).toBe(0);
+    });
+
+    it("should compute fallbackRate as fallbackCount over totalRequests", () => {
+      const collector = createMetricsCollector();
+      for (let i = 0; i < 4; i++) {
+        collector.record({ method: "getBlock", chainId: 1, strategy: "direct", success: true, responseTime: 5, cacheStatus: "miss" });
+      }
+      collector.recordFallback({ method: "getBlock", reason: "timeout" });
+
+      const snapshot = collector.getSnapshot();
+      expect(snapshot.fallbackRate).toBeCloseTo(1 / 4);
+      expect(snapshot.fallbackReasons).toEqual({ timeout: 1 });
+    });
+
+    it("should report zero fallback metrics when no fallback occurred", () => {
+      const collector = createMetricsCollector();
+      collector.record({ method: "getBalance", chainId: 1, strategy: "compressed", success: true, responseTime: 5, cacheStatus: "hit" });
+      collector.record({ method: "getBalance", chainId: 1, strategy: "compressed", success: false, responseTime: 8, cacheStatus: "unknown", error: "boom" });
+
+      const snapshot = collector.getSnapshot();
+      expect(snapshot.totalRequests).toBe(2);
+      expect(snapshot.fallbackCount).toBe(0);
+      expect(snapshot.fallbackRate).toBe(0);
+      expect(snapshot.fallbackReasons).toEqual({});
     });
 
     it("should compute nearest-rank percentiles from fixed samples", () => {
@@ -675,17 +755,32 @@ describe("Action Utils", () => {
       expect(snapshot.strategyCounts).toEqual({ compressed: 0, direct: 0 });
     });
 
+    it("should drop fallback counters on reset", () => {
+      const collector = createMetricsCollector();
+      collector.recordFallback({ method: "getBalance", reason: "network" });
+      collector.recordFallback({ method: "getBalance", reason: "429" });
+      expect(collector.getSnapshot().fallbackCount).toBe(2);
+
+      collector.reset();
+
+      const snapshot = collector.getSnapshot();
+      expect(snapshot.fallbackCount).toBe(0);
+      expect(snapshot.fallbackRate).toBe(0);
+      expect(snapshot.fallbackReasons).toEqual({});
+      expect(snapshot.methodStats.getBalance).toBeUndefined();
+    });
+
     it("should share one module-level collector and reset it via resetMetrics", () => {
       resetMetrics();
-      const first = getMetricsCollector();
-      expect(getMetricsCollector()).toBe(first);
+      const first = getSharedCollector();
+      expect(getSharedCollector()).toBe(first);
 
       first.record({ method: "getBalance", chainId: 1, strategy: "compressed", success: true, responseTime: 5, cacheStatus: "hit" });
-      expect(getMetricsCollector().getSnapshot().totalRequests).toBe(1);
+      expect(getSharedCollector().getSnapshot().totalRequests).toBe(1);
 
       resetMetrics();
-      expect(getMetricsCollector()).toBe(first);
-      expect(getMetricsCollector().getSnapshot().totalRequests).toBe(0);
+      expect(getSharedCollector()).toBe(first);
+      expect(getSharedCollector().getSnapshot().totalRequests).toBe(0);
     });
   });
 });

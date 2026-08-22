@@ -1,8 +1,18 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import {
+  describe,
+  it,
+  expect,
+  expectTypeOf,
+  vi,
+  beforeEach,
+  afterEach,
+} from "vitest";
 import type { MockInstance } from "vitest";
 import { createPublicClient, http } from "viem";
+import { createPublicClient as createProxyPublicClient } from "../client";
 import { mainnet } from "viem/chains";
 import { proxyActions } from "../actions/proxyActions";
+import type { ProxyActions } from "../actions/proxyActions";
 import { getBalance } from "../actions/getBalance.client";
 import { getBlockNumber } from "../actions/getBlockNumber.client";
 import { getBlock } from "../actions/getBlock.client";
@@ -20,12 +30,22 @@ import { getFeeHistory } from "../actions/getFeeHistory.client";
 import { getBlobBaseFee } from "../actions/getBlobBaseFee.client";
 import { readContract } from "../actions/readContract.client";
 import { batchActions } from "../actions/batch.client";
-import type { BatchResult } from "../actions/batch.client";
+import type {
+  BatchRequest,
+  BatchResult,
+} from "../actions/batch.client";
 import { preheatCache } from "../actions/preheat.client";
+import { purgeCache } from "../actions/purge.client";
 import { addMiddleware, clearMiddlewares } from "../actions/middleware";
 import type { RpcRequest, RpcResponse } from "../types";
-import { withProxy } from "../proxy";
-import { resetMetrics, getMetricsCollector } from "../utils/metrics";
+import { withProxy, getProxyConfig } from "../proxy";
+import {
+  configureProxy,
+  getProxyDefaults,
+  resetProxyDefaults,
+  resolveProxyConfig,
+} from "../actions/config";
+import { resetMetrics, getSharedCollector } from "../utils/metrics";
 
 const originalFetch = global.fetch;
 
@@ -86,10 +106,10 @@ describe("Modular Actions", () => {
       expect(extended.getFeeHistory).toBeDefined();
       expect(extended.getBlobBaseFee).toBeDefined();
       expect(extended.getCacheStats).toBeDefined();
-      expect(extended.clearCache).toBeDefined();
+      expect(extended.resetStats).toBeDefined();
     });
 
-    it("should expose live metrics via getCacheStats and reset via clearCache", async () => {
+    it("should expose live metrics via getCacheStats and reset via resetStats", async () => {
       resetMetrics();
       global.fetch = vi.fn().mockResolvedValueOnce({
         headers: new Headers({ "X-Cache": "HIT" }),
@@ -104,7 +124,7 @@ describe("Modular Actions", () => {
       expect(stats.cacheHits).toBe(1);
       expect(stats.methodStats.getBalance.count).toBe(1);
 
-      ext.clearCache();
+      ext.resetStats();
 
       const afterReset = ext.getCacheStats();
       expect(afterReset.totalRequests).toBe(0);
@@ -725,6 +745,118 @@ describe("Modular Actions", () => {
     });
   });
 
+  describe("fallback metrics", () => {
+    const makeClient = (opts: Record<string, unknown> = {}) => withProxy(
+      createPublicClient({ chain: mainnet, transport: http("https://eth.llamarpc.com") }),
+      { ...PROXY, fallback: true, retryOptions: NO_RETRY, ...opts }
+    );
+
+    it("should count a fallback once per request even after retries are exhausted", async () => {
+      resetMetrics();
+      const client = withProxy(
+        createPublicClient({ chain: mainnet, transport: http("https://eth.llamarpc.com") }),
+        { ...PROXY, fallback: true, retryOptions: { attempts: 3, delay: 0 } }
+      );
+      global.fetch = vi
+        .fn()
+        .mockRejectedValueOnce(new Error("fetch failed"))
+        .mockRejectedValueOnce(new Error("fetch failed"))
+        .mockRejectedValueOnce(new Error("fetch failed"))
+        .mockResolvedValueOnce(mockDirectRpc("0x1"));
+
+      const balance = await getBalance(client, { address: "0x1234567890123456789012345678901234567890" });
+      expect(balance).toBe(1n);
+
+      const stats = getSharedCollector().getSnapshot();
+      // 3 proxy attempts (retries exhausted) collapsed into ONE fallback event
+      expect(stats.fallbackCount).toBe(1);
+      expect(stats.totalRequests).toBe(1);
+      expect(stats.fallbackRate).toBe(1);
+      expect(stats.methodStats.getBalance.fallbackCount).toBe(1);
+    });
+
+    it("should classify network failures as network", async () => {
+      resetMetrics();
+      global.fetch = vi
+        .fn()
+        .mockRejectedValueOnce(new TypeError("fetch failed"))
+        .mockResolvedValueOnce(mockDirectRpc("0x1"));
+
+      await getBalance(makeClient(), { address: "0x1234567890123456789012345678901234567890" });
+
+      expect(getSharedCollector().getSnapshot().fallbackReasons).toEqual({ network: 1 });
+    });
+
+    it("should classify 5xx and 429 statuses by response code", async () => {
+      resetMetrics();
+      global.fetch = vi
+        .fn()
+        .mockResolvedValueOnce({ status: 500, headers: new Headers(), json: () => Promise.resolve({}) })
+        .mockResolvedValueOnce(mockDirectRpc("0x1"));
+      await getBalance(makeClient(), { address: "0x1234567890123456789012345678901234567890" });
+
+      global.fetch = vi
+        .fn()
+        .mockResolvedValueOnce({ status: 429, headers: new Headers(), json: () => Promise.resolve({}) })
+        .mockResolvedValueOnce(mockDirectRpc("0x1"));
+      await getBalance(makeClient(), { address: "0x1234567890123456789012345678901234567890" });
+
+      expect(getSharedCollector().getSnapshot().fallbackReasons).toEqual({ "429": 1, "5xx": 1 });
+    });
+
+    it("should keep successful requests free of fallback metrics", async () => {
+      resetMetrics();
+      global.fetch = mockProxyResponse("0x1");
+
+      await getBalance(makeClient(), { address: "0x1234567890123456789012345678901234567890" });
+
+      const stats = getSharedCollector().getSnapshot();
+      expect(stats.totalRequests).toBe(1);
+      expect(stats.fallbackCount).toBe(0);
+      expect(stats.fallbackRate).toBe(0);
+      expect(stats.fallbackReasons).toEqual({});
+    });
+
+    it("should not record a fallback when fallback is disabled", async () => {
+      resetMetrics();
+      const client = withProxy(
+        createPublicClient({ chain: mainnet, transport: http() }),
+        PROXY_NO_FALLBACK
+      );
+      global.fetch = vi.fn().mockRejectedValueOnce(new Error("fetch failed"));
+
+      await expect(getBalance(client, {
+        address: "0x1234567890123456789012345678901234567890",
+      })).rejects.toThrow("fetch failed");
+
+      const stats = getSharedCollector().getSnapshot();
+      expect(stats.fallbackCount).toBe(0);
+      expect(stats.fallbackReasons).toEqual({});
+    });
+
+    it("should expose fallback fields via getCacheStats and clear them on resetStats", async () => {
+      resetMetrics();
+      global.fetch = vi
+        .fn()
+        .mockRejectedValueOnce(new TypeError("fetch failed"))
+        .mockResolvedValueOnce(mockDirectRpc("0x1"));
+      const ext = proxyActions(makeClient());
+
+      await ext.getBalance({ address: "0x1234567890123456789012345678901234567890" });
+
+      const stats = ext.getCacheStats();
+      expect(stats.fallbackCount).toBe(1);
+      expect(stats.fallbackRate).toBe(1);
+      expect(stats.fallbackReasons).toEqual({ network: 1 });
+
+      ext.resetStats();
+      const after = ext.getCacheStats();
+      expect(after.fallbackCount).toBe(0);
+      expect(after.fallbackRate).toBe(0);
+      expect(after.fallbackReasons).toEqual({});
+    });
+  });
+
   describe("no-fallback throws for all actions", () => {
     const makeNoFallbackClient = () => withProxy(
       createPublicClient({ chain: mainnet, transport: http() }),
@@ -1194,8 +1326,8 @@ describe("Modular Actions", () => {
         ],
       });
       expect(results).toEqual([
-        { id: 1, result: "0x1" },
-        { id: 2, result: "0xff" },
+        { id: 1, result: BigInt("0x1") },
+        { id: 2, result: BigInt("0xff") },
       ]);
     });
 
@@ -1230,7 +1362,7 @@ describe("Modular Actions", () => {
         PROXY
       );
 
-      expect(results[0]).toEqual({ id: 1, result: "0x1" });
+      expect(results[0]).toEqual({ id: 1, result: BigInt("0x1") });
       expect(results[1].result).toBeUndefined();
       expect(results[1].error).toEqual({ code: -32603, message: "boom" });
     });
@@ -1256,8 +1388,8 @@ describe("Modular Actions", () => {
       expect(fetchMock.mock.calls[1][0]).toContain("/api/v1/1/getBalance");
       expect(fetchMock.mock.calls[2][0]).toContain("/api/v1/1/getBalance");
       expect(results).toEqual([
-        { id: 1, result: "0x11" },
-        { id: 2, result: "0x22" },
+        { id: 1, result: BigInt("0x11") },
+        { id: 2, result: BigInt("0x22") },
       ]);
     });
 
@@ -1280,7 +1412,7 @@ describe("Modular Actions", () => {
       );
 
       expect(fetchMock).toHaveBeenCalledTimes(3);
-      expect(results[0]).toEqual({ id: 1, result: "0x1" });
+      expect(results[0]).toEqual({ id: 1, result: BigInt("0x1") });
       expect(results[1].error?.message).toBe("Proxy error: upstream boom");
     });
 
@@ -1308,21 +1440,21 @@ describe("Modular Actions", () => {
         PROXY
       );
 
-      const stats = getMetricsCollector().getSnapshot();
+      const stats = getSharedCollector().getSnapshot();
       expect(stats.totalRequests).toBe(2);
       expect(stats.methodStats.getBalance.count).toBe(1);
       expect(stats.methodStats.getBlockNumber.count).toBe(1);
       resetMetrics();
     });
 
-    it("should expose batch() on the extended actions object", async () => {
+    it("should expose batchProxy() on the extended actions object", async () => {
       const fetchMock = vi
         .fn()
         .mockResolvedValueOnce(batchResponse([{ id: "a", result: "0x9" }]));
       global.fetch = fetchMock;
       const ext = proxyActions(proxiedClient);
 
-      const results: BatchResult[] = await ext.batch([
+      const results = await ext.batchProxy([
         { id: "a", action: "getGasPrice" },
       ]);
 
@@ -1334,7 +1466,7 @@ describe("Modular Actions", () => {
         action: "getGasPrice",
         args: {},
       });
-      expect(results).toEqual([{ id: "a", result: "0x9" }]);
+      expect(results).toEqual([{ id: "a", result: BigInt("0x9") }]);
     });
 
     it("should run items natively when the client has no proxy config", async () => {
@@ -1344,12 +1476,278 @@ describe("Modular Actions", () => {
       });
       global.fetch = vi.fn().mockResolvedValueOnce(mockDirectRpc("0x9999"));
 
-      const results = await proxyActions(plainClient).batch([
+      const results = await proxyActions(plainClient).batchProxy([
         { id: 1, action: "getBalance", args: { address: ADDRESS } },
       ]);
 
       expect(results).toEqual([{ id: 1, result: BigInt("0x9999") }]);
       expect(global.fetch).toHaveBeenCalledTimes(1);
+    });
+
+    it("should keep batchProxy through viem's client.extend (no key stripping)", async () => {
+      // viem's `extend` deletes extension keys that collide with core
+      // client properties (`batch` is a core config key — the old name
+      // was stripped at runtime); `batchProxy` must survive. The `as any`
+      // bridge only works around the pre-existing strict-mode signature
+      // gap of the full actions object (tracked separately); the extend
+      // call itself is the real viem runtime path.
+      const fetchMock = vi
+        .fn()
+        .mockResolvedValueOnce(batchResponse([{ id: 1, result: "0x5" }]));
+      global.fetch = fetchMock;
+
+      const base = createPublicClient({
+        chain: mainnet,
+        transport: http("https://eth.llamarpc.com"),
+      });
+      const extended = (base as any).extend(
+        proxyActions({ ...PROXY, retryOptions: { attempts: 1, delay: 0 } })
+      ) as typeof base & ProxyActions;
+
+      expect(typeof extended.batchProxy).toBe("function");
+
+      const results = await extended.batchProxy([
+        { id: 1, action: "getGasPrice" },
+      ]);
+
+      const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+      expect(url).toBe("https://proxy.example.com/api/v1/batch");
+      expect(init.method).toBe("POST");
+      expect(JSON.parse(init.body as string).requests[0]).toEqual({
+        id: 1,
+        chainId: 1,
+        action: "getGasPrice",
+        args: {},
+      });
+      expect(results).toEqual([{ id: 1, result: BigInt("0x5") }]);
+    });
+
+    it("should infer each item's result type from its action", async () => {
+      global.fetch = vi.fn().mockResolvedValueOnce(
+        batchResponse([
+          { id: 1, result: "0x1" },
+          { id: 2, result: "0x42" },
+          { id: 3, result: "0x89" },
+        ])
+      );
+
+      const results = await batchActions(
+        [
+          { id: 1, action: "getBalance", args: { address: ADDRESS } },
+          { id: 2, action: "getBlockNumber" },
+          { id: 3, action: "getChainId" },
+        ],
+        PROXY
+      );
+
+      // Positional inference: each entry follows its item's action
+      expectTypeOf(results[0].result).toEqualTypeOf<bigint | undefined>();
+      expectTypeOf(results[1].result).toEqualTypeOf<bigint | undefined>();
+      expectTypeOf(results[2].result).toEqualTypeOf<number | undefined>();
+      // @ts-expect-error -- getBalance results are bigint, not number
+      expectTypeOf(results[0].result).toEqualTypeOf<number | undefined>();
+      // The result list is a mapped tuple aligned with the request items
+      expectTypeOf(results).toEqualTypeOf<
+        readonly [
+          BatchResult<"getBalance">,
+          BatchResult<"getBlockNumber">,
+          BatchResult<"getChainId">
+        ]
+      >();
+
+      // Runtime matches the types: wire hex quantities are decoded to the
+      // viem value each entry is typed with
+      expect(results).toEqual([
+        { id: 1, result: 1n },
+        { id: 2, result: 66n },
+        { id: 3, result: 137 },
+      ]);
+    });
+
+    it("should type item args per action and infer single-typed batches", async () => {
+      // Compile-time only: never invoked, so no fetch mock is consumed
+      const typeLevel = () =>
+        batchActions(
+          [
+            // @ts-expect-error -- getBalance args require an address
+            { id: 1, action: "getBalance", args: {} },
+            // @ts-expect-error -- getBlockNumber takes no args
+            { id: 2, action: "getBlockNumber", args: { blockTag: "latest" } },
+          ],
+          PROXY
+        );
+      void typeLevel;
+
+      global.fetch = vi
+        .fn()
+        .mockResolvedValueOnce(batchResponse([{ id: 1, result: "0x9" }]));
+
+      // Pre-typed single-action arrays keep their inference
+      const items: BatchRequest<"getGasPrice">[] = [
+        { id: 1, action: "getGasPrice" },
+      ];
+      const results = await batchActions(items, PROXY);
+      expectTypeOf(results).toEqualTypeOf<BatchResult<"getGasPrice">[]>();
+      expectTypeOf(results[0].result).toEqualTypeOf<bigint | undefined>();
+      expect(results).toEqual([{ id: 1, result: BigInt("0x9") }]);
+
+      // The bound client method keeps the same inference
+      global.fetch = vi
+        .fn()
+        .mockResolvedValueOnce(batchResponse([{ id: "a", result: "0x7" }]));
+      const ext = proxyActions(proxiedClient);
+      const bound = await ext.batchProxy([{ id: "a", action: "getBlobBaseFee" }]);
+      expectTypeOf(bound).toEqualTypeOf<
+        readonly [BatchResult<"getBlobBaseFee">]
+      >();
+      expect(bound).toEqual([{ id: "a", result: BigInt("0x7") }]);
+    });
+
+    it("should normalize results on both the batch endpoint and the serial fallback", async () => {
+      // Full round trip through the serial fallback (the endpoint path is
+      // covered above): both proxy paths decode wire values the same way
+      const fetchMock = vi
+        .fn()
+        .mockRejectedValueOnce(new Error("batch down"))
+        .mockResolvedValueOnce(proxyResponse("0x11"))
+        .mockResolvedValueOnce(proxyResponse("0x22"));
+      global.fetch = fetchMock;
+
+      const results = await batchActions(
+        [
+          { id: 1, action: "getBalance", args: { address: ADDRESS } },
+          { id: 2, action: "getGasPrice" },
+        ],
+        { ...PROXY, retryOptions: NO_RETRY }
+      );
+
+      expect(fetchMock).toHaveBeenCalledTimes(3);
+      expect(fetchMock.mock.calls[1][0]).toContain("/api/v1/1/getBalance");
+      expect(fetchMock.mock.calls[2][0]).toContain("/api/v1/1/getGasPrice");
+      expect(results).toEqual([
+        { id: 1, result: 17n },
+        { id: 2, result: 34n },
+      ]);
+      expect(typeof results[0].result).toBe("bigint");
+      expect(typeof results[1].result).toBe("bigint");
+    });
+
+    it("should decode proxy-path results into viem values per action", async () => {
+      // Raw JSON-RPC wire payloads as the proxy returns them
+      global.fetch = vi.fn().mockResolvedValueOnce(
+        batchResponse([
+          { id: 1, result: "0xde0b6b3a7640000" }, // getBalance
+          // readContract: uint8 18
+          {
+            id: 2,
+            result:
+              "0x0000000000000000000000000000000000000000000000000000000000000012",
+          },
+          // getFeeHistory: raw hex-quantity fee history
+          {
+            id: 3,
+            result: {
+              oldestBlock: "0x10",
+              baseFeePerGas: ["0x1", "0x2"],
+              gasUsedRatio: [0.5, 0.25],
+              reward: [["0x3", "0x4"]],
+            },
+          },
+          { id: 4, result: "0x89" }, // getChainId
+          { id: 5, result: "0x5209" }, // estimateGas
+        ])
+      );
+
+      const [balance, decimals, feeHistory, chainId, gas] = await batchActions(
+        [
+          { id: 1, action: "getBalance", args: { address: ADDRESS } },
+          {
+            id: 2,
+            action: "readContract",
+            args: {
+              address: ADDRESS,
+              abi: [
+                {
+                  type: "function",
+                  name: "decimals",
+                  inputs: [],
+                  outputs: [{ type: "uint8", name: "" }],
+                  stateMutability: "view",
+                },
+              ],
+              functionName: "decimals",
+            },
+          },
+          { id: 3, action: "getFeeHistory", args: { blockCount: 2 } },
+          { id: 4, action: "getChainId" },
+          { id: 5, action: "estimateGas", args: { to: ADDRESS } },
+        ],
+        PROXY
+      );
+
+      // Each item holds the same viem value the single-action client
+      // returns for the same wire value, matching its inferred type
+      expect(balance.result).toBe(BigInt("0xde0b6b3a7640000"));
+      expect(decimals.result).toBe(18);
+      expect(feeHistory.result).toEqual({
+        baseFeePerGas: [1n, 2n],
+        gasUsedRatio: [0.5, 0.25],
+        oldestBlock: 16n,
+        reward: [[3n, 4n]],
+      });
+      expect(chainId.result).toBe(137);
+      expect(gas.result).toBe(BigInt("0x5209"));
+    });
+
+    it("should pass readContract items without an ABI through untouched", async () => {
+      // A caller pre-encoding calldata sends wire-style `data` args; with
+      // no ABI there is nothing to decode against, so the raw hex stays
+      global.fetch = vi
+        .fn()
+        .mockResolvedValueOnce(batchResponse([{ id: 1, result: "0x12" }]));
+
+      const [read] = await batchActions(
+        [
+          {
+            id: 1,
+            action: "readContract",
+            // Deliberately bypasses the typed viem-style args
+            args: { address: ADDRESS, data: "0x31323334" },
+          } as unknown as BatchRequest<"readContract">,
+        ],
+        PROXY
+      );
+
+      expect(read.result).toBe("0x12");
+      expect(read.error).toBeUndefined();
+    });
+
+    it("should isolate per-item decode failures as error entries", async () => {
+      global.fetch = vi.fn().mockResolvedValueOnce(
+        batchResponse([
+          { id: 1, result: "0x1" },
+          { id: 2, result: "not-a-hex-quantity" },
+          { id: 3, result: "0xff" },
+        ])
+      );
+
+      const results = await batchActions(
+        [
+          { id: 1, action: "getBalance", args: { address: ADDRESS } },
+          { id: 2, action: "getBalance", args: { address: ADDRESS } },
+          { id: 3, action: "getBlockNumber" },
+        ],
+        PROXY
+      );
+
+      // Only the failing item degrades to an error entry
+      expect(results[0]).toEqual({ id: 1, result: 1n });
+      expect(results[1].result).toBeUndefined();
+      expect(results[1].error).toEqual({
+        code: -32603,
+        message: expect.stringContaining("Failed to decode getBalance result"),
+      });
+      expect(results[2]).toEqual({ id: 3, result: 255n });
     });
   });
 
@@ -1503,6 +1901,110 @@ describe("Modular Actions", () => {
     });
   });
 
+  describe("cache purge", () => {
+    const purgeReport = {
+      purged: { dedup: 2, cache: 1 },
+      scope: "colo",
+      limitations: [
+        "caches.default.delete only affects the Cloudflare colo serving this request",
+      ],
+    };
+
+    it("should POST all requests to /api/v1/purge with auth and trace headers", async () => {
+      const fetchMock = vi.fn().mockResolvedValue({
+        json: () => Promise.resolve(purgeReport),
+      });
+      global.fetch = fetchMock;
+
+      const requests = [
+        { chainId: 1, action: "getBalance", args: { address: "0xabc" } },
+        { chainId: 137, action: "getBlockNumber" },
+      ];
+      const result = await purgeCache(requests, {
+        endpoint: "https://proxy.example.com",
+        apiKey: "secret-key",
+      });
+
+      expect(result).toEqual(purgeReport);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+      expect(url).toBe("https://proxy.example.com/api/v1/purge");
+      expect(init.method).toBe("POST");
+      expect(init.headers).toMatchObject({
+        "Content-Type": "application/json",
+        "X-API-Key": "secret-key",
+      });
+      expect(String((init.headers as Record<string, string>)["X-Trace-Id"])).toMatch(
+        /^[0-9a-f]{12}$/
+      );
+      expect(JSON.parse(init.body as string)).toEqual({ requests });
+    });
+
+    it("should retry transient failures with the configured policy", async () => {
+      let attempts = 0;
+      global.fetch = vi.fn().mockImplementation(() => {
+        attempts += 1;
+        return Promise.resolve(
+          attempts % 2 === 1
+            ? { status: 502, json: () => Promise.resolve({}) }
+            : { json: () => Promise.resolve(purgeReport) }
+        );
+      });
+
+      const result = await purgeCache(
+        [{ chainId: 1, action: "getBlockNumber" }],
+        {
+          endpoint: "https://proxy.example.com",
+          retryOptions: { attempts: 2, delay: 0 },
+        }
+      );
+
+      expect(attempts).toBe(2);
+      expect(result).toEqual(purgeReport);
+    });
+
+    it("should throw the server error immediately on non-retryable responses", async () => {
+      const fetchMock = vi.fn().mockResolvedValue({
+        json: () =>
+          Promise.resolve({
+            error: { code: -32602, message: "Method-level purge is not supported" },
+          }),
+      });
+      global.fetch = fetchMock;
+
+      await expect(
+        purgeCache([{ chainId: 1, action: "getBalance" }], {
+          endpoint: "https://proxy.example.com",
+          retryOptions: { attempts: 3, delay: 0 },
+        })
+      ).rejects.toThrow("Method-level purge is not supported");
+      expect(fetchMock).toHaveBeenCalledTimes(1); // not retried
+    });
+
+    it("should return zero deletions for an empty list or missing endpoint", async () => {
+      const fetchMock = vi.fn();
+      global.fetch = fetchMock as unknown as typeof fetch;
+
+      await expect(
+        purgeCache([], { endpoint: "https://proxy.example.com" })
+      ).resolves.toEqual({
+        purged: { dedup: 0, cache: 0 },
+        scope: "colo",
+        limitations: [],
+      });
+      await expect(
+        purgeCache([{ chainId: 1, action: "getBlockNumber" }], {
+          endpoint: "",
+        })
+      ).resolves.toEqual({
+        purged: { dedup: 0, cache: 0 },
+        scope: "colo",
+        limitations: [],
+      });
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+  });
+
   describe("middleware", () => {
     const ADDRESS = "0x1234567890123456789012345678901234567890";
     const proxyResponse = (result: unknown) => ({
@@ -1647,5 +2149,329 @@ describe("Modular Actions", () => {
 
       expect(seen).toEqual(["getBalance"]);
     });
+  });
+});
+
+describe("global proxy defaults (configureProxy)", () => {
+  const ADDRESS = "0x1234567890123456789012345678901234567890";
+  const proxyResponse = (result: unknown) => ({
+    json: () => Promise.resolve({ result, timestamp: Date.now() }),
+  });
+
+  // Module defaults are process-global state: always restore so the
+  // suites above and below observe the unconfigured library.
+  afterEach(() => {
+    resetProxyDefaults();
+    global.fetch = originalFetch;
+  });
+
+  it("should expose no defaults until configureProxy is called", () => {
+    expect(getProxyDefaults()).toEqual({});
+  });
+
+  it("should merge partial defaults across calls and hand out copies", () => {
+    configureProxy({ endpoint: "https://default-proxy.example.com" });
+    configureProxy({ timeout: 10000 });
+
+    const snapshot = getProxyDefaults();
+    expect(snapshot).toEqual({
+      endpoint: "https://default-proxy.example.com",
+      timeout: 10000,
+    });
+
+    // Mutating the snapshot must not leak into the module state
+    snapshot.endpoint = "https://mutated.example.com";
+    expect(getProxyDefaults().endpoint).toBe(
+      "https://default-proxy.example.com"
+    );
+  });
+
+  it("should keep built-in defaults for keys never configured", () => {
+    configureProxy({ endpoint: "https://default-proxy.example.com" });
+
+    const config = resolveProxyConfig(undefined);
+    expect(config.endpoint).toBe("https://default-proxy.example.com");
+    expect(config.timeout).toBe(30000);
+    expect(config.fallback).toBe(true);
+    expect(config.retryOptions).toEqual({ attempts: 3, delay: 500 });
+  });
+
+  it("should hand out fresh copies from resolution", () => {
+    configureProxy({
+      endpoint: "https://default-proxy.example.com",
+      retryOptions: { attempts: 5, delay: 10 },
+    });
+
+    const resolved = resolveProxyConfig(undefined);
+    resolved.endpoint = "https://mutated.example.com";
+    resolved.retryOptions.attempts = 99;
+
+    const fresh = resolveProxyConfig(undefined);
+    expect(fresh.endpoint).toBe("https://default-proxy.example.com");
+    expect(fresh.retryOptions.attempts).toBe(5);
+  });
+
+  it("should restore the unconfigured state after resetProxyDefaults", () => {
+    configureProxy({ endpoint: "https://default-proxy.example.com" });
+    expect(getProxyDefaults().endpoint).toBe(
+      "https://default-proxy.example.com"
+    );
+
+    resetProxyDefaults();
+
+    expect(getProxyDefaults()).toEqual({});
+    const client = withProxy(
+      createPublicClient({ chain: mainnet, transport: http() })
+    );
+    expect(getProxyConfig(client).endpoint).toBe("");
+  });
+
+  it("should inherit module defaults in withProxy without a config", () => {
+    configureProxy({
+      endpoint: "https://default-proxy.example.com",
+      timeout: 10000,
+    });
+
+    const client = withProxy(
+      createPublicClient({ chain: mainnet, transport: http() })
+    );
+
+    const config = getProxyConfig(client);
+    expect(config.endpoint).toBe("https://default-proxy.example.com");
+    expect(config.timeout).toBe(10000);
+  });
+
+  it("should let explicit withProxy config win over module defaults per key", () => {
+    configureProxy({
+      endpoint: "https://default-proxy.example.com",
+      timeout: 10000,
+      debug: true,
+    });
+
+    const client = withProxy(
+      createPublicClient({ chain: mainnet, transport: http() }),
+      { endpoint: "https://explicit.example.com" }
+    );
+
+    const config = getProxyConfig(client);
+    expect(config.endpoint).toBe("https://explicit.example.com"); // explicit wins
+    expect(config.timeout).toBe(10000); // inherited from module defaults
+    expect(config.debug).toBe(true); // inherited from module defaults
+  });
+
+  it("should stay on the native path when no endpoint is configured anywhere", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(mockDirectRpc("0x2a"));
+    global.fetch = fetchMock;
+
+    // Bare client: no withProxy mount, no configureProxy call
+    const client = createPublicClient({
+      chain: mainnet,
+      transport: http("https://eth.llamarpc.com"),
+    });
+    const balance = await getBalance(client, { address: ADDRESS });
+
+    expect(balance).toBe(42n);
+    expect(String(fetchMock.mock.calls[0][0])).not.toContain("/api/v1/");
+  });
+
+  it("should run single actions through the module-default endpoint", async () => {
+    configureProxy({
+      endpoint: "https://default-proxy.example.com",
+      retryOptions: { attempts: 1, delay: 0 },
+    });
+    const fetchMock = vi.fn().mockResolvedValue(proxyResponse("0x1"));
+    global.fetch = fetchMock;
+
+    const client = withProxy(
+      createPublicClient({ chain: mainnet, transport: http() })
+    );
+    const balance = await getBalance(client, { address: ADDRESS });
+
+    expect(balance).toBe(1n);
+    expect(String(fetchMock.mock.calls[0][0])).toContain(
+      "https://default-proxy.example.com/api/v1/1/getBalance?p="
+    );
+  });
+
+  it("should resolve module defaults in the client form of proxyActions", async () => {
+    configureProxy({
+      endpoint: "https://default-proxy.example.com",
+      retryOptions: { attempts: 1, delay: 0 },
+    });
+    const fetchMock = vi.fn().mockResolvedValue(proxyResponse("0x1"));
+    global.fetch = fetchMock;
+
+    const ext = proxyActions(
+      createPublicClient({ chain: mainnet, transport: http() })
+    );
+    await ext.getBalance({ address: ADDRESS });
+
+    expect(String(fetchMock.mock.calls[0][0])).toContain(
+      "https://default-proxy.example.com/api/v1/1/getBalance?p="
+    );
+  });
+
+  it("should resolve the proxyActions config form over module defaults", async () => {
+    configureProxy({
+      endpoint: "https://default-proxy.example.com",
+      timeout: 10000,
+    });
+    const fetchMock = vi.fn().mockResolvedValue(proxyResponse("0x1"));
+    global.fetch = fetchMock;
+
+    const client = createPublicClient({ chain: mainnet, transport: http() });
+    const ext = proxyActions({ timeout: 2000 })(client);
+
+    expect(getProxyConfig(client).timeout).toBe(2000); // explicit key wins
+    await ext.getBalance({ address: ADDRESS });
+
+    // Endpoint inherited from module defaults
+    expect(String(fetchMock.mock.calls[0][0])).toContain(
+      "https://default-proxy.example.com/api/v1/1/getBalance?p="
+    );
+  });
+
+  it("should route createPublicClient through module defaults without a proxy key", async () => {
+    configureProxy({
+      endpoint: "https://default-proxy.example.com",
+      retryOptions: { attempts: 1, delay: 0 },
+    });
+    const fetchMock = vi.fn().mockResolvedValue(proxyResponse("0x1"));
+    global.fetch = fetchMock;
+
+    const client = createProxyPublicClient({
+      chain: mainnet,
+      transport: http(),
+    });
+    await client.getBalance({ address: ADDRESS });
+
+    expect(String(fetchMock.mock.calls[0][0])).toContain(
+      "https://default-proxy.example.com/api/v1/1/getBalance?p="
+    );
+  });
+
+  it("should let createPublicClient proxy config win over module defaults", () => {
+    configureProxy({
+      endpoint: "https://default-proxy.example.com",
+      timeout: 10000,
+    });
+
+    const client = createProxyPublicClient({
+      chain: mainnet,
+      transport: http(),
+      proxy: { endpoint: "https://client.example.com" },
+    });
+
+    expect(client.proxy.endpoint).toBe("https://client.example.com");
+    expect(client.proxy.timeout).toBe(10000); // inherited from module defaults
+    expect(getProxyConfig(client).endpoint).toBe("https://client.example.com");
+  });
+
+  it("should keep proxy disabled when createPublicClient opts out explicitly", async () => {
+    configureProxy({ endpoint: "https://default-proxy.example.com" });
+    const fetchMock = vi.fn().mockResolvedValue(mockDirectRpc("0x2a"));
+    global.fetch = fetchMock;
+
+    const client = createProxyPublicClient({
+      chain: mainnet,
+      transport: http("https://eth.llamarpc.com"),
+      proxy: { enabled: false },
+    });
+
+    expect(client.proxy.enabled).toBe(false);
+
+    // Explicit opt-out: the client's own methods stay on the native path
+    // even though a module-default endpoint exists
+    const balance = await client.getBalance({ address: ADDRESS });
+    expect(balance).toBe(42n);
+    expect(String(fetchMock.mock.calls[0][0])).not.toContain("/api/v1/");
+  });
+
+  it("should use module defaults in batchActions without a config", async () => {
+    configureProxy({ endpoint: "https://default-proxy.example.com" });
+    const fetchMock = vi.fn().mockResolvedValue({
+      json: () => Promise.resolve({ results: [{ id: 1, result: "0x1" }] }),
+    });
+    global.fetch = fetchMock;
+
+    const results = await batchActions([{ id: 1, action: "getBlockNumber" }]);
+
+    expect(String(fetchMock.mock.calls[0][0])).toBe(
+      "https://default-proxy.example.com/api/v1/batch"
+    );
+    expect(results[0].result).toBe(1n);
+  });
+
+  it("should let explicit batchActions config win over module defaults", async () => {
+    configureProxy({ endpoint: "https://default-proxy.example.com" });
+    const fetchMock = vi.fn().mockResolvedValue({
+      json: () => Promise.resolve({ results: [{ id: 1, result: "0x1" }] }),
+    });
+    global.fetch = fetchMock;
+
+    await batchActions([{ id: 1, action: "getChainId" }], {
+      endpoint: "https://explicit.example.com",
+    });
+
+    expect(String(fetchMock.mock.calls[0][0])).toBe(
+      "https://explicit.example.com/api/v1/batch"
+    );
+  });
+
+  it("should use module defaults in preheatCache without a config and keep single-attempt retries", async () => {
+    configureProxy({ endpoint: "https://default-proxy.example.com" });
+    const fetchMock = vi.fn().mockRejectedValue(new Error("network down"));
+    global.fetch = fetchMock;
+
+    const result = await preheatCache([
+      { action: "getBalance", args: { address: ADDRESS } },
+    ]);
+
+    expect(result).toEqual({ submitted: 1, failed: 1 });
+    // Module defaults did not silently enable the 3-attempt retry policy:
+    // preheat stays single-attempt unless retryOptions are configured
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("should honor module retryOptions in preheatCache when configured there", async () => {
+    configureProxy({
+      endpoint: "https://default-proxy.example.com",
+      retryOptions: { attempts: 2, delay: 0 },
+    });
+    const fetchMock = vi.fn().mockRejectedValue(new Error("network down"));
+    global.fetch = fetchMock;
+
+    await preheatCache([
+      { action: "getBalance", args: { address: ADDRESS } },
+    ]);
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("should use module defaults in purgeCache without a config", async () => {
+    configureProxy({
+      endpoint: "https://default-proxy.example.com",
+      apiKey: "module-key",
+    });
+    const fetchMock = vi.fn().mockResolvedValue({
+      json: () =>
+        Promise.resolve({
+          purged: { dedup: 1, cache: 1 },
+          scope: "colo",
+          limitations: [],
+        }),
+    });
+    global.fetch = fetchMock;
+
+    const report = await purgeCache([{ chainId: 1, action: "getBalance" }]);
+
+    expect(report.purged).toEqual({ dedup: 1, cache: 1 });
+    expect(String(fetchMock.mock.calls[0][0])).toBe(
+      "https://default-proxy.example.com/api/v1/purge"
+    );
+    const init = fetchMock.mock.calls[0][1] as RequestInit;
+    expect((init.headers as Record<string, string>)["X-API-Key"]).toBe(
+      "module-key"
+    );
   });
 });

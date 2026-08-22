@@ -26,8 +26,22 @@ export type MetricsEntry = {
   error?: string;
 };
 
+/**
+ * A recorded fallback event: a proxy request that failed and fell back
+ * to the original RPC. Every fallback means the proxy delivered no
+ * value for that request, so these are counted as a first-class
+ * observability signal.
+ */
+export type FallbackEntry = {
+  /** Proxy action name (e.g. "getBalance") */
+  method: string;
+  /** Why the proxy call failed: "network" | "timeout" | "5xx" | "429" | "abort" | "other" */
+  reason: string;
+};
+
 export type MetricsCollector = {
   record: (entry: MetricsEntry) => void;
+  recordFallback: (entry: FallbackEntry) => void;
   getSnapshot: () => PerformanceMetrics;
   reset: () => void;
 };
@@ -58,6 +72,7 @@ const createRingBuffer = (capacity: number) => {
 type MethodState = {
   count: number;
   errorCount: number;
+  fallbackCount: number;
   cacheHits: number;
   cacheMisses: number;
   chainIds: Set<number>;
@@ -67,6 +82,7 @@ type MethodState = {
 const createMethodState = (capacity: number): MethodState => ({
   count: 0,
   errorCount: 0,
+  fallbackCount: 0,
   cacheHits: 0,
   cacheMisses: 0,
   chainIds: new Set<number>(),
@@ -94,6 +110,7 @@ export const percentile = (sortedValues: number[], p: number): number => {
 type Counters = {
   count: number;
   errorCount: number;
+  fallbackCount: number;
   cacheHits: number;
   cacheMisses: number;
 };
@@ -111,6 +128,7 @@ const summarize = (counters: Counters, times: number[]): MethodMetrics => {
   return {
     count: counters.count,
     errorCount: counters.errorCount,
+    fallbackCount: counters.fallbackCount,
     errorRate: counters.count > 0 ? counters.errorCount / counters.count : 0,
     cacheHits: counters.cacheHits,
     cacheMisses: counters.cacheMisses,
@@ -133,6 +151,8 @@ export const createMetricsCollector = (
   let methods = new Map<string, MethodState>();
   let globalRing = createRingBuffer(maxSamples);
   let strategyCounts = emptyStrategyCounts();
+  let fallbackCount = 0;
+  let fallbackReasons: Record<string, number> = {};
 
   const methodState = (method: string): MethodState => {
     const existing = methods.get(method);
@@ -162,12 +182,20 @@ export const createMetricsCollector = (
       if (cacheStatus === "miss") state.cacheMisses += 1;
     },
 
+    recordFallback: ({ method, reason }: FallbackEntry): void => {
+      const state = methodState(method);
+      state.fallbackCount += 1;
+      fallbackCount += 1;
+      fallbackReasons[reason] = (fallbackReasons[reason] ?? 0) + 1;
+    },
+
     getSnapshot: (): PerformanceMetrics => {
       const methodStats: Record<string, MethodMetrics> = {};
       const chainIds = new Set<number>();
       const totals: Counters = {
         count: 0,
         errorCount: 0,
+        fallbackCount: 0,
         cacheHits: 0,
         cacheMisses: 0,
       };
@@ -175,6 +203,7 @@ export const createMetricsCollector = (
         methodStats[method] = summarize(state, state.ring.toArray());
         totals.count += state.count;
         totals.errorCount += state.errorCount;
+        totals.fallbackCount += state.fallbackCount;
         totals.cacheHits += state.cacheHits;
         totals.cacheMisses += state.cacheMisses;
         state.chainIds.forEach((id) => chainIds.add(id));
@@ -184,6 +213,13 @@ export const createMetricsCollector = (
         totalRequests: totals.count,
         errorCount: global.errorCount,
         errorRate: global.errorRate,
+        fallbackCount,
+        fallbackRate: totals.count > 0 ? fallbackCount / totals.count : 0,
+        fallbackReasons: Object.fromEntries(
+          Object.keys(fallbackReasons)
+            .sort()
+            .map((reason) => [reason, fallbackReasons[reason]])
+        ),
         cacheHits: global.cacheHits,
         cacheMisses: global.cacheMisses,
         cacheHitRate: global.cacheHitRate,
@@ -201,6 +237,8 @@ export const createMetricsCollector = (
       methods = new Map();
       globalRing = createRingBuffer(maxSamples);
       strategyCounts = emptyStrategyCounts();
+      fallbackCount = 0;
+      fallbackReasons = {};
     },
   };
 };
@@ -211,14 +249,14 @@ let sharedCollector: MetricsCollector | undefined;
  * Get the module-level collector shared by all proxy requests.
  * Instrumentation in `makeProxyRequest` records into this instance.
  */
-export const getMetricsCollector = (): MetricsCollector => {
+export const getSharedCollector = (): MetricsCollector => {
   if (!sharedCollector) sharedCollector = createMetricsCollector();
   return sharedCollector;
 };
 
 /** Reset the module-level collector, dropping all recorded metrics */
 export const resetMetrics = (): void => {
-  getMetricsCollector().reset();
+  getSharedCollector().reset();
 };
 
 /**

@@ -9,34 +9,82 @@ import {
 } from "./handlers/proxy";
 import { handleActionRequest } from "./handlers/actions";
 import { handleBatchRequest } from "./handlers/batch";
+import { handleHealthRequest } from "./handlers/health";
+import { handlePurgeRequest } from "./handlers/purge";
+import { handleDashboardRequest } from "./handlers/dashboard";
 import {
   setAllowedChainIds,
   setCustomRpcUrls,
   setMaxRpcConcurrency,
 } from "./actions/utils";
-import { timingSafeEqualString } from "./utils/auth";
+import { PUBLIC_API_PATHS, timingSafeEqualString } from "./utils/auth";
+import {
+  matchOrigin,
+  ORIGIN_CHECK_EXEMPT_PATHS,
+  parseOriginAllowlist,
+} from "./utils/origin";
 import { resolveTraceId } from "./utils/cache";
+import {
+  parseRateLimitPerMinute,
+  RATE_LIMIT_EXEMPT_PATHS,
+  resolveClientId,
+  type RateLimitVerdict,
+} from "./utils/rate-limit";
 import {
   aggregatePeriods,
   DEFAULT_STATS_HOURS,
   MAX_STATS_HOURS,
+  recordRequestStats,
   STATISTICS_DO_NAME,
   type StatsSummary,
 } from "./utils/statistics";
 
 export { ProxyState } from "./durable-objects/proxy-state";
+export { RateLimiter } from "./durable-objects/rate-limiter";
 export { Statistics } from "./durable-objects/statistics";
 
 const app = new Hono<{ Bindings: Env }>();
 
-app.use(
-  "*",
-  cors({
-    origin: "*",
-    allowMethods: ["GET", "POST", "OPTIONS"],
-    allowHeaders: ["Content-Type", "X-API-Key"],
-  })
-);
+// CORS response policy. Default (ALLOWED_ORIGINS unset) is deliberately
+// permissive — `Access-Control-Allow-Origin: *` on a read-only,
+// credential-free, CDN-cacheable RPC surface — documented to be paired
+// with API_KEY and rate limiting. When ALLOWED_ORIGINS is configured the
+// allowlist also tightens this layer: a matching Origin is echoed verbatim
+// instead of `*` (hono adds `Vary: Origin` so shared caches key per
+// origin), and a non-matching or absent Origin gets no ACAO header at all,
+// so browsers reject cross-origin reads — and preflights — from outside
+// the allowlist before any proxied work happens. hono's cors() only takes
+// static options, but the rules come from env, so the configured
+// middleware is cached per isolate keyed by the raw var (constant per
+// isolate; see parseOriginAllowlist's parse cache).
+const corsAllowMethods = ["GET", "POST", "OPTIONS"];
+const corsAllowHeaders = ["Content-Type", "X-API-Key"];
+const permissiveCors = cors({
+  origin: "*",
+  allowMethods: corsAllowMethods,
+  allowHeaders: corsAllowHeaders,
+});
+let allowlistCorsCache:
+  | { raw: string; handler: ReturnType<typeof cors> }
+  | undefined;
+
+app.use("*", (c, next) => {
+  const raw = c.env.ALLOWED_ORIGINS;
+  if (raw === undefined || raw === "") return permissiveCors(c, next);
+
+  if (allowlistCorsCache?.raw !== raw) {
+    const rules = parseOriginAllowlist(raw);
+    allowlistCorsCache = {
+      raw,
+      handler: cors({
+        allowMethods: corsAllowMethods,
+        allowHeaders: corsAllowHeaders,
+        origin: (origin) => (matchOrigin(rules, origin) ? origin : undefined),
+      }),
+    };
+  }
+  return allowlistCorsCache.handler(c, next);
+});
 
 app.use("*", logger());
 app.use("*", prettyJSON());
@@ -61,6 +109,90 @@ app.use("/api/v1/*", async (c, next) => {
     statusText: c.res.statusText,
     headers,
   });
+});
+
+// Origin allowlist (browser-scoped abuse guard). Browser requests carry an
+// Origin header; server-side/mobile callers never do. When ALLOWED_ORIGINS
+// is set, an Origin-carrying request that does not match the allowlist is
+// rejected with 403 here — before rate limiting and auth, because browser
+// abuse is cheapest to stop at the door (and a leaked-frontend origin
+// cannot be revoked via API_KEY). Requests without Origin pass through and
+// remain protected by API_KEY + rate limiting. Registered after the trace
+// middleware so 403s carry X-Trace-Id/X-Cache like other guards. Only
+// ORIGIN_CHECK_EXEMPT_PATHS (/dashboard — the unauthenticated read-only
+// operator page) is exempt; API endpoints including /api/v1/stats and
+// /api/v1/health are NOT: browsers reach them from allowlisted domains or
+// not at all. A 403 here never touches upstream or Durable Objects.
+app.use("*", async (c, next) => {
+  const rules = parseOriginAllowlist(c.env.ALLOWED_ORIGINS);
+  if (rules === null || ORIGIN_CHECK_EXEMPT_PATHS.has(c.req.path)) {
+    return next();
+  }
+  const origin = c.req.header("Origin");
+  if (origin === undefined || origin === "" || matchOrigin(rules, origin)) {
+    return next();
+  }
+  return c.json(
+    { error: { code: -32000, message: "Origin not allowed" } },
+    403
+  );
+});
+
+// Per-IP rate limiting on the proxied API surface, enforced by the
+// RateLimiter Durable Object (fixed 60s windows, one instance per client)
+// so the budget is accurate across isolates and PoPs — an isolate-local
+// counter would undercount. Registered BEFORE the auth middleware on
+// purpose: it is the outermost abuse guard, so floods of unauthenticated
+// or invalid-key requests are rejected without any config/auth work, and
+// those 401s still consume the attacker's own per-IP budget. Read-only
+// monitoring endpoints (RATE_LIMIT_EXEMPT_PATHS: /api/v1/stats,
+// /api/v1/health) are exempt so an operator can always observe a flood.
+// Fails open: limiting is a protection add-on, never a hard dependency.
+app.use("/api/v1/*", async (c, next) => {
+  const limit = parseRateLimitPerMinute(c.env.RATE_LIMIT_PER_MINUTE);
+  if (limit === 0 || !c.env.RATE_LIMITER) {
+    // Disabled by config, or the binding is missing (misconfiguration).
+    return next();
+  }
+  if (RATE_LIMIT_EXEMPT_PATHS.has(c.req.path)) return next();
+
+  const clientId = resolveClientId(c.req.header("CF-Connecting-IP"));
+  const stub = c.env.RATE_LIMITER.get(c.env.RATE_LIMITER.idFromName(clientId));
+
+  let verdict: RateLimitVerdict | undefined;
+  try {
+    const response = await stub.fetch(
+      new Request(`http://rate-limiter/consume?limit=${limit}`)
+    );
+    if (response.ok) {
+      verdict = await response.json<RateLimitVerdict>();
+    }
+  } catch {
+    // DO unreachable: fail open.
+  }
+  if (verdict === undefined || verdict.allowed) return next();
+
+  // Rejected requests are never successes: record them as errors under the
+  // "rate_limit" method (filterable via GET /api/v1/stats?method=rate_limit).
+  recordRequestStats(c, {
+    method: "rate_limit",
+    chainId: 0,
+    cacheStatus: "MISS",
+    error: true,
+    durationMs: 0,
+  });
+
+  return c.json(
+    {
+      error: {
+        code: -32005,
+        message: "Rate limit exceeded",
+        data: { retryAfterSeconds: verdict.retryAfterSeconds },
+      },
+    },
+    429,
+    { "Retry-After": String(verdict.retryAfterSeconds) }
+  );
 });
 
 app.use("/api/*", async (c, next) => {
@@ -101,9 +233,10 @@ app.use("/api/*", async (c, next) => {
   // Authentication: the X-API-Key header only. Query-string keys (`?key=`)
   // are deliberately not accepted — they would leak into CDN cache keys and
   // access logs. The comparison is constant-time so response latency does
-  // not reveal the expected key.
+  // not reveal the expected key. Paths in PUBLIC_API_PATHS (health & co.)
+  // stay credential-free so uptime monitors can probe the service.
   const apiKey = c.env.API_KEY;
-  if (apiKey) {
+  if (apiKey && !PUBLIC_API_PATHS.has(c.req.path)) {
     const provided = c.req.header("X-API-Key");
     if (provided === undefined || !timingSafeEqualString(provided, apiKey)) {
       return c.json(
@@ -139,6 +272,20 @@ app.get("/api/v1/:chainId/:method", handleCompressedRequest);
 
 // Direct requests
 app.post("/api/v1/direct/:chainId/:method", handleDirectRequest);
+
+// Health endpoint: unauthenticated liveness & configuration snapshot for
+// deployers and uptime monitors. Reports upstream URL counts only (never
+// the URLs) and performs no upstream RPC calls unless `?deep=1` probes at
+// most 5 chains with a per-probe timeout. Exempt from the API key via
+// PUBLIC_API_PATHS; not recorded in statistics (it proxies nothing).
+app.get("/api/v1/health", handleHealthRequest);
+
+// Cache purge: an admin operation, so it deliberately does NOT join the
+// PUBLIC_API_PATHS / RATE_LIMIT_EXEMPT_PATHS exemptions — with API_KEY
+// configured it is authenticated (401 without a valid key) and always
+// charged against the caller's rate-limit budget. Without API_KEY the
+// handler refuses with 501 rather than running unauthenticated.
+app.post("/api/v1/purge", handlePurgeRequest);
 
 // Stats endpoint: aggregated server-side statistics from the Statistics DO.
 // Supports ?chainId=&method=&hours= (hours defaults to 24, max 720).
@@ -213,6 +360,15 @@ app.get("/api/v1/stats", async (c) => {
     );
   }
 });
+
+// Dashboard page: a single inline-HTML monitoring UI over /api/v1/stats
+// (summary cards, per-hour bar chart, bucket table, filters, auto-refresh).
+// The shell itself carries no data and stays credential-free — every number
+// is fetched browser-side through the stats endpoint, which keeps its own
+// auth and rate-limit rules. Registered in PUBLIC_API_PATHS and
+// RATE_LIMIT_EXEMPT_PATHS as a read-only monitoring surface; the path also
+// sits outside the /api/* middleware scopes, so those entries are defensive.
+app.get("/dashboard", handleDashboardRequest);
 
 app.onError((err, c) => {
   console.error("Unhandled error:", err);

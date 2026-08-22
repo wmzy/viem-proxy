@@ -70,10 +70,9 @@ async function extendPatternExample() {
   console.log("\n=== Extend Pattern Example ===");
 
   // Method 2: attach the proxy config with withProxy, then get the actions
-  // object directly. (`client.extend(proxyActions({...}))` proxies the
-  // regular actions, but viem's extend strips the `batch` extension key at
-  // runtime and conflicts with it under strict TypeScript — so prefer this
-  // form when you need `actions.batch(...)`.)
+  // object directly. (`client.extend(proxyActions({...}))` works too — the
+  // batch method is named `batchProxy` so it survives viem's extend, which
+  // strips extension keys colliding with core client properties.)
   const { withProxy } = await import("../src");
 
   const client = createPublicClient({
@@ -207,8 +206,9 @@ async function metricsExample() {
   console.log(`P95 response time: ${stats.responseTimeP95}ms`);
   console.log("Per-method stats:", stats.methodStats);
 
-  // Reset the locally collected metrics (client-side statistics only)
-  client.clearCache();
+  // Reset the locally collected metrics (client-side statistics only;
+  // this does not purge the CDN cache)
+  client.resetStats();
   console.log("Metrics reset");
 }
 
@@ -228,7 +228,7 @@ async function batchExample() {
 
   // Per-item isolation: a failing item yields an `error` entry,
   // the rest still resolve; `chainId` overrides the target chain per item
-  const results = await client.batch([
+  const results = await client.batchProxy([
     { id: 1, action: "getBalance", args: { address: "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045" } },
     { id: 2, action: "getBlockNumber" },
     { id: 3, action: "getGasPrice", chainId: 137 },

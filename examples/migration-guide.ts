@@ -203,7 +203,7 @@ async function useProxyMethods() {
   console.log(`Cache hit rate: ${(stats.cacheHitRate * 100).toFixed(1)}%`);
 
   // Batch multiple actions in one round trip (per-item isolation)
-  const results = await proxyClient.batch([
+  const results = await proxyClient.batchProxy([
     { id: 1, action: "getBalance", args: { address: "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045" } },
     { id: 2, action: "getBlockNumber" },
   ]);
@@ -223,8 +223,9 @@ async function useProxyMethods() {
     return next(request);
   });
 
-  // Reset local statistics if needed (client-side metrics only)
-  proxyClient.clearCache();
+  // Reset local statistics if needed (client-side metrics only;
+  // does not purge the CDN cache)
+  proxyClient.resetStats();
   console.log("Metrics reset");
 }
 

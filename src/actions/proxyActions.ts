@@ -1,8 +1,9 @@
 import type { Client, Chain, Transport } from "viem";
 import { withProxy } from "../proxy";
 import type { ProxyActionConfig } from "./types";
+import { resolveProxyConfig } from "./config";
 import type { PerformanceMetrics, ProxyMiddleware } from "../types";
-import { getMetricsCollector, resetMetrics } from "../utils/metrics";
+import { getSharedCollector, resetMetrics } from "../utils/metrics";
 import { addMiddleware } from "./middleware";
 import { preheatClientCache } from "./preheat.client";
 import type { PreheatRequest, PreheatResult } from "./preheat.client";
@@ -35,7 +36,7 @@ import { getStorageAt } from "./getStorageAt.client";
 import { getFeeHistory } from "./getFeeHistory.client";
 import { getBlobBaseFee } from "./getBlobBaseFee.client";
 import { batchClientActions } from "./batch.client";
-import type { BatchRequest, BatchResult } from "./batch.client";
+import type { BatchRequest, BatchRequests } from "./batch.client";
 
 /**
  * Build the proxy actions object bound to a client.
@@ -136,9 +137,16 @@ const buildProxyActions = <TChain extends Chain | undefined>(
    * yields an `error` result while the rest resolve. When the batch
    * endpoint is unavailable the call degrades to serial single requests;
    * without a proxy config items run through the native actions.
+   *
+   * Named `batchProxy` (not `batch`) because viem clients already carry
+   * a `batch` multicall config property: viem's `extend` strips any
+   * extension key that exists on the core client, so a `batch` action
+   * would be type-rejected under strict TypeScript and silently removed
+   * at runtime in extend mode.
    */
-  batch: (requests: BatchRequest[]): Promise<BatchResult[]> =>
-    batchClientActions(client)(requests),
+  batchProxy: <const T extends readonly BatchRequest[]>(
+    requests: T & BatchRequests<T>
+  ) => batchClientActions(client)<T>(requests),
 
   /**
    * Preheat the CDN cache for the given requests. Each item fires through
@@ -161,17 +169,19 @@ const buildProxyActions = <TChain extends Chain | undefined>(
 
   /**
    * Get a snapshot of locally collected performance metrics: request
-   * counts, cache hit rate, error rate and response-time percentiles
-   * (P50/P95/P99), with a per-method breakdown.
+   * counts, cache hit rate, error rate, response-time percentiles
+   * (P50/P95/P99) and fallback observability (fallbackCount /
+   * fallbackRate / fallbackReasons — a fallback means the proxy
+   * delivered no value for that request), with a per-method breakdown.
    */
-  getCacheStats: (): PerformanceMetrics => getMetricsCollector().getSnapshot(),
+  getCacheStats: (): PerformanceMetrics => getSharedCollector().getSnapshot(),
 
   /**
    * Reset the locally collected metrics. This only clears client-side
-   * statistics — purging the CDN cache itself requires server-side
-   * support and will be provided in a later version.
+   * statistics — it does not purge the CDN cache, which requires
+   * server-side support and will be provided in a later version.
    */
-  clearCache: (): void => {
+  resetStats: (): void => {
     resetMetrics();
   },
 });
@@ -179,12 +189,15 @@ const buildProxyActions = <TChain extends Chain | undefined>(
 /**
  * Proxy actions for extending a viem client. Two call signatures:
  *
- * 1. `proxyActions(config)` returns an extension function for viem's
- *    `client.extend(...)`. The config is attached to the client when
- *    the extension runs.
+ * 1. `proxyActions(config?)` returns an extension function for viem's
+ *    `client.extend(...)`. The config (a partial) is merged over the
+ *    module defaults set by `configureProxy` and attached to the client
+ *    when the extension runs; omitted keys inherit module defaults,
+ *    then built-in defaults.
  * 2. `proxyActions(client)` returns the actions object directly. The
- *    client must already carry a proxy config (via `withProxy`);
- *    otherwise every action falls back to native viem behavior.
+ *    client resolves its config via `getProxyConfig` (client-mounted
+ *    values win over module defaults); without any proxy config every
+ *    action falls back to native viem behavior.
  *
  * @example
  * import { createPublicClient, http } from 'viem'
@@ -202,32 +215,39 @@ const buildProxyActions = <TChain extends Chain | undefined>(
  * const balance = await client.getBalance({ address: '0x...' })
  *
  * @example
- * import { withProxy } from 'viem-proxy'
+ * import { configureProxy, withProxy } from 'viem-proxy'
  *
- * const actions = proxyActions(withProxy(client, { endpoint: 'https://proxy.example.com' }))
+ * // endpoint/timeout set once, inherited everywhere below
+ * configureProxy({ endpoint: 'https://proxy.example.com', timeout: 10000 })
+ * const actions = proxyActions(withProxy(client))
  * const balance = await actions.getBalance({ address: '0x...' })
  */
 export function proxyActions<TChain extends Chain | undefined>(
   client: Client<Transport, TChain>
 ): ProxyActions;
 export function proxyActions(
-  config: ProxyActionConfig
+  config?: Partial<ProxyActionConfig>
 ): <TChain extends Chain | undefined>(
   client: Client<Transport, TChain>
 ) => ProxyActions;
 export function proxyActions(
-  clientOrConfig:
+  clientOrConfig?:
     | Client<Transport, Chain | undefined>
-    | ProxyActionConfig
+    | Partial<ProxyActionConfig>
 ):
   | ProxyActions
   | ((client: Client<Transport, Chain | undefined>) => ProxyActions) {
-  // Config form: attach the config to the extended client, then build
-  // actions so they resolve it via getProxyConfig.
-  if ("endpoint" in clientOrConfig) {
+  // A viem client always carries a `transport`; anything else (including
+  // an empty object) is a config form. The config is merged over module
+  // defaults (configureProxy) and attached to the extended client, so
+  // actions resolve it via getProxyConfig.
+  if (clientOrConfig === undefined || !("transport" in clientOrConfig)) {
+    const config = resolveProxyConfig(
+      clientOrConfig as Partial<ProxyActionConfig> | undefined
+    );
     return <TChain extends Chain | undefined>(
       client: Client<Transport, TChain>
-    ) => buildProxyActions(withProxy(client, clientOrConfig));
+    ) => buildProxyActions(withProxy(client, config));
   }
 
   // Client form: config (if any) already attached via withProxy.

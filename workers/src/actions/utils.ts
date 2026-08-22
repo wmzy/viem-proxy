@@ -80,6 +80,24 @@ export const isSupportedChainId = (chainId: number): boolean => {
 };
 
 /**
+ * Enumerate the chain IDs currently servable, sorted ascending: every chain
+ * with at least one configured upstream RPC URL (defaults ∪ custom),
+ * narrowed by the allowlist when one is set. Used by the health endpoint to
+ * report configuration — returns IDs only, never the URLs themselves.
+ */
+export const getSupportedChainIds = (): number[] => {
+  const candidates = new Set<number>([
+    ...Object.keys(DEFAULT_RPC_URLS).map(Number),
+    ...Object.keys(customRpcUrls).map(Number),
+  ]);
+  const servable: number[] = [];
+  for (const chainId of candidates) {
+    if (isSupportedChainId(chainId)) servable.push(chainId);
+  }
+  return servable.sort((a, b) => a - b);
+};
+
+/**
  * Parse a chain ID path segment and validate it with `isSupportedChainId`.
  * Returns null for anything that is not a plain positive decimal integer
  * naming a servable chain ("abc", "-1", "1.5", "0", "1e9" all fail).

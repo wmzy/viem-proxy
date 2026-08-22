@@ -1,7 +1,7 @@
 import type { Client, Chain, Transport, Block } from "viem";
 import { getBlock as viemGetBlock } from "viem/actions";
 import { getProxyConfig } from "../proxy";
-import { makeProxyRequest } from "./utils";
+import { makeProxyRequest, recordFallback } from "./utils";
 
 export type GetBlockParameters = {
   blockHash?: string;
@@ -42,6 +42,7 @@ export const getBlock = async <TChain extends Chain | undefined>(
     return result;
   } catch (error) {
     if (proxy.fallback !== false) {
+      recordFallback("getBlock", error);
       if (proxy.debug) {
         console.warn("[viem-proxy] Fallback to direct RPC:", error);
       }
