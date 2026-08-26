@@ -13,7 +13,7 @@ export default defineConfig({
         "examples/",
         "**/*.d.ts",
         "**/*.config.*",
-        ".eslintrc.js",
+        "eslint.config.*",
       ],
     },
   },

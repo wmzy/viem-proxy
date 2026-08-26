@@ -54,11 +54,12 @@ const mockProxyResponse = <T>(result: T) =>
     json: () => Promise.resolve({ result, timestamp: Date.now() }),
   });
 
-const mockDirectRpc = (result: unknown) => ({
-  ok: true,
-  headers: new Headers({ "content-type": "application/json" }),
-  json: () => Promise.resolve({ jsonrpc: "2.0", id: 1, result }),
-});
+// viem ≥2.55 的 http transport 用 response.text() 读响应体（并按 Content-Type 解析），
+// 裸对象 mock 缺 text()/标准 Headers 会导致请求失败并触发重试放大
+const mockDirectRpc = (result: unknown) =>
+  new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result }), {
+    headers: { "content-type": "application/json" },
+  });
 
 const PROXY = { endpoint: "https://proxy.example.com" };
 // Retry disabled so these tests exercise the fallback-disabled error path directly
