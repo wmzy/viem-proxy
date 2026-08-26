@@ -183,7 +183,7 @@ const client = createPublicClient({
 
 ### 方式 A：一键部署（推荐）
 
-点击下方按钮，Cloudflare 会把 `workers/` 子目录克隆到你的 GitHub 账户、自动创建并绑定两个 Durable Objects（参数存储 + 统计），然后构建部署。全程无需本地环境：
+点击下方按钮，Cloudflare 会把 `workers/` 子目录克隆到你的 GitHub 账户、自动创建并绑定三个 Durable Objects（参数存储 ProxyState、统计 Statistics、限流 RateLimiter），然后构建部署。全程无需本地环境：
 
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/wmzy/viem-proxy/tree/main/workers)
 
@@ -195,6 +195,13 @@ const client = createPublicClient({
 | `API_KEY` | 推荐 | 认证密钥。**不设置则任何人都能使用你部署的服务、消耗你的 RPC 配额**，请务必设置 |
 | `ALLOWED_CHAIN_IDS` | 可选 | 可服务的链 ID 白名单，如 `"1,137"`；不设置则服务所有已配置上游的链 |
 | `RATE_LIMIT_PER_MINUTE` | 可选 | 每 IP 每分钟请求预算，默认 `"60"`，设 `"0"` 禁用。只读监控端点（`/api/v1/stats`、`/api/v1/health`）不受限流影响 |
+
+> **关于部署表单里的 Build / Deploy command**
+>
+> 表单读取的是 **`workers/` 子目录的 package.json**（部署后该目录就是你账户中新仓库的根），而不是仓库根目录那个客户端库的 package.json——所以在仓库根目录找不到 `deploy` script 是正常的。
+>
+> - **Build command 留空是预期行为**：workers 后端没有独立构建步骤，`wrangler deploy` 会直接用 esbuild 打包 TypeScript 源码。
+> - **Deploy command**（`pnpm run deploy`）对应 `workers/package.json` 中的 `"deploy": "wrangler deploy"` script，保持默认即可。
 
 部署完成后，用部署页给出的 `*.workers.dev` 域名作为客户端的 `endpoint` 即可。回到「快速开始」连接它。
 
