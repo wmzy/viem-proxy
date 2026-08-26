@@ -18,6 +18,12 @@ class_name = "Statistics"
 name = "RATE_LIMITER"
 class_name = "RateLimiter"
 
+# Hash->params mapping store for the large-parameter hash-reference flow
+# (POST /api/v1/store + GET /api/v1/cached/{chainId}:{method}:{hash})
+[[durable_objects.bindings]]
+name = "PARAM_STORE"
+class_name = "ParamStore"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["ProxyState"]
@@ -29,6 +35,10 @@ new_sqlite_classes = ["Statistics"]
 [[migrations]]
 tag = "v3"
 new_sqlite_classes = ["RateLimiter"]
+
+[[migrations]]
+tag = "v4"
+new_sqlite_classes = ["ParamStore"]
 
 [vars]
 ENVIRONMENT = "production"

@@ -35,7 +35,11 @@ export type HealthResponse = {
   version: string;
   environment: string | undefined;
   chains: ChainHealth[];
-  durableObjects: { proxyState: boolean; statistics: boolean };
+  durableObjects: {
+    proxyState: boolean;
+    statistics: boolean;
+    paramStore: boolean;
+  };
   rateLimit: { enabled: boolean; limitPerMinute: number };
   deep?: { checked: number; chains: DeepChainCheck[] };
 };
@@ -128,6 +132,7 @@ export const handleHealthRequest = async (
     durableObjects: {
       proxyState: Boolean(c.env.PROXY_STATE),
       statistics: Boolean(c.env.STATISTICS),
+      paramStore: Boolean(c.env.PARAM_STORE),
     },
     rateLimit: parseRateLimit(c.env.RATE_LIMIT_PER_MINUTE),
     ...(deepChecks !== undefined

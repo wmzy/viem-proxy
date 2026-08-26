@@ -20,6 +20,13 @@ export type ProxyActionConfig = {
   apiKey?: string;
   /** Retry policy for transient failures (network errors, timeouts, 5xx, 429) */
   retryOptions?: ProxyRetryOptions;
+  /**
+   * Params size (JSON chars) at or above which requests use the large-
+   * parameter hash-reference flow (`/api/v1/cached/{chain}:{method}:{hash}`)
+   * instead of a compressed query string. Must match the server's
+   * COMPRESSION_THRESHOLD for cache-key parity; default 1500.
+   */
+  compressionThreshold?: number;
 };
 
 export type ProxyResponse<T> = {

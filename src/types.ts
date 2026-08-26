@@ -35,7 +35,10 @@ export type ProxyTransportConfig = {
   proxy?: Partial<ProxyConfig>;
 };
 
-export type RequestStrategy = "compressed" | "direct";
+export type RequestStrategy =
+  | "compressed"
+  | "direct"
+  | "cached";
 
 export type CompressedRequest = {
   strategy: RequestStrategy;

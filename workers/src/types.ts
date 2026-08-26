@@ -1,11 +1,13 @@
 import type { ProxyState } from "./durable-objects/proxy-state";
 import type { RateLimiter } from "./durable-objects/rate-limiter";
 import type { Statistics } from "./durable-objects/statistics";
+import type { ParamStore } from "./durable-objects/param-store";
 
 export type Env = {
   PROXY_STATE: DurableObjectNamespace<ProxyState>;
   STATISTICS: DurableObjectNamespace<Statistics>;
   RATE_LIMITER: DurableObjectNamespace<RateLimiter>;
+  PARAM_STORE: DurableObjectNamespace<ParamStore>;
   ENVIRONMENT: string;
   MAX_CACHE_TTL: string;
   DEFAULT_CACHE_TTL: string;

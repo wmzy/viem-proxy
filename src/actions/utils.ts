@@ -12,6 +12,16 @@ import { applyMiddlewareChain } from "./middleware";
 /** Requests slower than this (ms) get a debug warning carrying the trace id */
 export const SLOW_REQUEST_MS = 1000;
 
+/**
+ * Default params-size threshold for the hash-reference flow. Keep in sync
+ * with the server's COMPRESSION_THRESHOLD default so both sides derive the
+ * same cache keys.
+ */
+export const DEFAULT_COMPRESSION_THRESHOLD = 1500;
+
+/** Error code the worker answers with when a cached-URL hash is unknown. */
+export const PARAMS_NOT_FOUND_CODE = -32004;
+
 export const DEFAULT_RETRY_OPTIONS: Required<ProxyRetryOptions> = {
   attempts: 3,
   delay: 500,
@@ -24,6 +34,7 @@ export const DEFAULT_PROXY_CONFIG: Required<ProxyActionConfig> = {
   debug: false,
   apiKey: "",
   retryOptions: { ...DEFAULT_RETRY_OPTIONS },
+  compressionThreshold: DEFAULT_COMPRESSION_THRESHOLD,
 };
 
 /** Reason category for a proxy failure that fell back to direct RPC */
@@ -188,6 +199,112 @@ export const makeProxyRequest = async <T>(
   let strategy: RequestStrategy = "direct";
   const collector = getSharedCollector();
 
+  // SHA-256 of the raw params JSON, hex-encoded — the same digest the
+  // worker recomputes in POST /api/v1/store, so both sides agree on the
+  // hash→params binding and the /api/v1/cached cache key.
+  const sha256Hex = async (input: string): Promise<string> => {
+    const digest = await crypto.subtle.digest(
+      "SHA-256",
+      new TextEncoder().encode(input)
+    );
+    return Array.from(new Uint8Array(digest), (b) =>
+      b.toString(16).padStart(2, "0")
+    ).join("");
+  };
+
+  const fetchJson = async (url: string, init: RequestInit): Promise<Response> => {
+    try {
+      return await fetch(url, init);
+    } catch (error) {
+      throw new RetryableError(
+        error instanceof Error ? error.message : String(error),
+        { cause: error, reason: fetchFailureReason(error) }
+      );
+    }
+  };
+
+  /**
+   * Large-payload path: probe the fixed-length cached URL first (CDN-
+   * cacheable), register the params via POST /api/v1/store when the server
+   * reports an unknown hash (-32004), then re-probe. Servers without these
+   * endpoints answer 400/404/405 with a different code; the resulting
+   * plain error falls through to the caller's direct-RPC fallback.
+   */
+  const sendViaHashReference = async (
+    chainId: number,
+    functionName: string,
+    argsJson: string
+  ): Promise<T> => {
+    strategy = "cached";
+    const paramHash = await sha256Hex(argsJson);
+    const cachedUrl =
+      `${endpoint}/api/v1/cached/${chainId}:${functionName}:${paramHash}`;
+    const cachedInit = (): RequestInit => ({
+      method: "GET",
+      headers,
+      signal: AbortSignal.timeout(timeout),
+    });
+
+    if (debug) {
+      console.log(
+        `[viem-proxy][trace:${traceId}] ${functionName} hash-ref lookup: ${paramHash.slice(0, 12)} (${argsJson.length} chars)`
+      );
+    }
+
+    return withRetry(
+      async () => {
+        let response = await fetchJson(cachedUrl, cachedInit());
+
+        if (response.status === 404) {
+          const errBody = (await response.json().catch(() => undefined)) as
+            | ProxyErrorResponse
+            | undefined;
+          if (errBody?.error?.code === PARAMS_NOT_FOUND_CODE) {
+            const stored = await fetchJson(`${endpoint}/api/v1/store`, {
+              method: "POST",
+              headers,
+              body: JSON.stringify({ hash: paramHash, params: argsJson }),
+              signal: AbortSignal.timeout(timeout),
+            });
+            if (!stored.ok && !isRetryableStatus(stored.status)) {
+              throw new Error(`Store request failed: HTTP ${stored.status}`);
+            }
+            response = await fetchJson(cachedUrl, cachedInit());
+          } else {
+            throw new Error("Cached lookup failed: HTTP 404");
+          }
+        }
+
+        lastCacheStatus = readCacheStatus(response);
+
+        if (isRetryableStatus(response.status)) {
+          throw new RetryableError(`HTTP ${response.status}`, {
+            reason: response.status === 429 ? "429" : "5xx",
+          });
+        }
+
+        const data = (await response.json()) as
+          | ProxyResponse<T>
+          | ProxyErrorResponse;
+
+        if ("error" in data) {
+          throw new Error(`Proxy error: ${data.error.message}`);
+        }
+
+        return data.result;
+      },
+      retryOptions,
+      debug
+        ? (error, attemptNo, backoff) => {
+            console.warn(
+              `[viem-proxy][trace:${traceId}] ${functionName} hash-ref retry ${attemptNo} in ${backoff}ms:`,
+              error.message
+            );
+          }
+        : undefined
+    );
+  };
+
   // Core sender: performs the actual HTTP round trip for `request`. It is
   // a function of the request so the middleware chain can modify the
   // action, chain and args before anything is built; URL construction,
@@ -195,6 +312,14 @@ export const makeProxyRequest = async <T>(
   // possibly-modified values.
   const send = async (request: RpcRequest): Promise<T> => {
     const argsJson = JSON.stringify(request.args);
+
+    if (
+      argsJson.length >=
+      (config.compressionThreshold ?? DEFAULT_COMPRESSION_THRESHOLD)
+    ) {
+      return sendViaHashReference(request.chainId, request.functionName, argsJson);
+    }
+
     const compressed = compressParams(argsJson);
     const getUrl = `${endpoint}/api/v1/${request.chainId}/${request.functionName}?p=${compressed.compressed}`;
 

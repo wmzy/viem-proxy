@@ -9,6 +9,8 @@ import {
 } from "./handlers/proxy";
 import { handleActionRequest } from "./handlers/actions";
 import { handleBatchRequest } from "./handlers/batch";
+import { handleStoreRequest } from "./handlers/store";
+import { handleCachedRequest } from "./handlers/cached";
 import { handleHealthRequest } from "./handlers/health";
 import { handlePurgeRequest } from "./handlers/purge";
 import { handleDashboardRequest } from "./handlers/dashboard";
@@ -41,6 +43,7 @@ import {
 
 export { ProxyState } from "./durable-objects/proxy-state";
 export { RateLimiter } from "./durable-objects/rate-limiter";
+export { ParamStore } from "./durable-objects/param-store";
 export { Statistics } from "./durable-objects/statistics";
 
 const app = new Hono<{ Bindings: Env }>();
@@ -67,6 +70,27 @@ const permissiveCors = cors({
 let allowlistCorsCache:
   | { raw: string; handler: ReturnType<typeof cors> }
   | undefined;
+
+// Reject malformed percent-encoding before anything touches the URL: Hono's
+// internal query decoding throws URIError on sequences like "%%%", which
+// would otherwise bubble to app.onError as a framework-level 500 instead of
+// the caller-error 400 the API contract calls for.
+app.use("/api/*", async (c, next) => {
+  try {
+    decodeURIComponent(new URL(c.req.url).search);
+  } catch {
+    return c.json(
+      {
+        error: {
+          code: -32602,
+          message: "Malformed percent-encoding in query string",
+        },
+      },
+      400
+    );
+  }
+  await next();
+});
 
 app.use("*", (c, next) => {
   const raw = c.env.ALLOWED_ORIGINS;
@@ -263,6 +287,14 @@ app.get("/", (c) => {
 // Batch action requests (POST: never CDN-cached by design; per-item
 // isolation with the same dedup/stats path as single actions)
 app.post("/api/v1/batch", handleBatchRequest);
+
+// Parameter storage for the large-parameter hash-reference flow
+app.post("/api/v1/store", handleStoreRequest);
+
+// Hash-referenced large-parameter requests (GET for CDN caching). Must be
+// registered before the `/:chainId/:method` wildcard below, which would
+// otherwise capture `cached` as a chain ID.
+app.get("/api/v1/cached/:cacheKey", handleCachedRequest);
 
 // Action-based requests (modular actions)
 app.post("/api/v1/:chainId/:actionName", handleActionRequest);

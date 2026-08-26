@@ -134,7 +134,7 @@ describe("Client", () => {
         responseTimeP95: 0,
         responseTimeP99: 0,
         chainIds: [],
-        strategyCounts: { compressed: 0, direct: 0 },
+        strategyCounts: { compressed: 0, direct: 0, cached: 0 },
         methodStats: {},
       });
     });

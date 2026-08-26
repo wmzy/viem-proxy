@@ -1,4 +1,5 @@
 import type { RpcRequest, RpcResponse } from "./types";
+import { UPSTREAM_EXHAUSTED_PREFIX } from "../utils/errors";
 
 const DEFAULT_RPC_URLS: Record<number, string[]> = {
   1: [
@@ -220,6 +221,8 @@ const executeWithFailover = async (
 ): Promise<{ result: unknown; blockNumber?: string }> => {
   const rpcUrls = getRpcUrls(chainId);
 
+  let lastError: unknown;
+
   for (let i = 0; i < rpcUrls.length; i++) {
     const rpcUrl = rpcUrls[i];
 
@@ -270,11 +273,20 @@ const executeWithFailover = async (
         blockNumber,
       };
     } catch (error) {
+      lastError = error;
       console.error(`[RPC] Failed to call ${rpcUrl}:`, error);
-      if (i === rpcUrls.length - 1) {
-        throw new Error(`All RPC endpoints failed for chain ${chainId}`);
-      }
     }
+  }
+
+  if (lastError !== undefined) {
+    // Aggregate the final endpoint-level reason so callers and operators
+    // can tell rate limiting, DNS failures and RPC errors apart without
+    // enabling debug mode. The message never contains upstream URLs.
+    const reason =
+      lastError instanceof Error ? lastError.message : String(lastError);
+    throw new Error(
+      `${UPSTREAM_EXHAUSTED_PREFIX} for chain ${chainId} (last error: ${reason})`
+    );
   }
 
   throw new Error(`No working RPC endpoint for chain ${chainId}`);

@@ -92,6 +92,7 @@ const createMethodState = (capacity: number): MethodState => ({
 const emptyStrategyCounts = (): Record<RequestStrategy, number> => ({
   compressed: 0,
   direct: 0,
+  cached: 0,
 });
 
 /**

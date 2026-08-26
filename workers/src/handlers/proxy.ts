@@ -16,6 +16,7 @@ import {
   setCacheHeaders,
 } from "../utils/cache";
 import { recordRequestStats } from "../utils/statistics";
+import { responseErrorMessage } from "../utils/errors";
 import type { CacheStatus } from "../types";
 import {
   getRpcUrls,
@@ -182,6 +183,98 @@ const executeWithDeduplication = async (
 };
 
 /**
+ * Shared execution+response pipeline for the two CDN-cacheable read paths:
+ * `GET /api/v1/{chainId}/{method}?p=...` (compressed query params) and
+ * `GET /api/v1/cached/{chainId}:{method}:{hash}` (hash-referenced large
+ * params). Both resolve to (chainId, method, params) and then behave
+ * identically: action dispatch for known actions carrying an args object,
+ * raw-RPC pass-through otherwise, DO deduplication, per-method cache
+ * headers and stats.
+ */
+export const executeAndRespond = async (
+  c: Context<{ Bindings: Env }>,
+  chainIdNum: number,
+  method: string,
+  rawParams: unknown,
+  traceId: string
+): Promise<Response> => {
+  // Callers hand us the output of JSON.parse (typed unknown); downstream
+  // helpers predate that strictness and take the parsed array/object as any.
+  const params = rawParams as any[];
+  // The client's default path sends action names (e.g. `getBalance`) with
+  // a compressed args object. Route those through the exact same pipeline
+  // as POST /api/v1/:chainId/:actionName so args are converted to RPC
+  // params by the action handlers. Anything else (e.g. `eth_getBalance`
+  // with a params array) is passed through to the upstream node as a raw
+  // RPC call, preserving the direct-RPC contract.
+  if (
+    method in actionHandlers &&
+    typeof params === "object" &&
+    params !== null &&
+    !Array.isArray(params)
+  ) {
+    const actionName = method as ActionName;
+    const result = await executeActionWithDeduplication(
+      c,
+      chainIdNum,
+      actionName,
+      params as Record<string, unknown>
+    );
+
+    const rpcMethod = ACTION_TO_RPC_METHOD[actionName] ?? actionName;
+    const cacheStrategy = getCacheStrategy(
+      chainIdNum,
+      rpcMethod,
+      params,
+      300,
+      result.blockNumber ? parseInt(result.blockNumber, 16) : undefined
+    );
+
+    const response = c.json({
+      result: result.result,
+      blockNumber: result.blockNumber,
+      timestamp: Date.now(),
+    });
+
+    return setCacheHeaders(response, cacheStrategy.ttl, {
+      cacheStatus: result.cacheStatus,
+      traceId,
+    });
+  }
+
+  // Build request info
+  const requestInfo: RequestInfo = {
+    chainId: chainIdNum,
+    method,
+    params,
+    strategy: "compressed",
+  };
+
+  // Execute RPC call with deduplication
+  const result = await executeWithDeduplication(c, requestInfo);
+
+  // Set cache strategy
+  const cacheStrategy = getCacheStrategy(
+    requestInfo.chainId,
+    method,
+    params,
+    300,
+    result.blockNumber ? parseInt(result.blockNumber, 16) : undefined
+  );
+
+  const response = c.json({
+    result: result.result,
+    blockNumber: result.blockNumber,
+    timestamp: Date.now(),
+  });
+
+  return setCacheHeaders(response, cacheStrategy.ttl, {
+    cacheStatus: result.cacheStatus,
+    traceId,
+  });
+};
+
+/**
  * Handle compressed parameter GET requests
  */
 export const handleCompressedRequest = async (
@@ -214,90 +307,30 @@ export const handleCompressedRequest = async (
       );
     }
 
-    // Decompress parameters
-    const paramsStr = decompressParams(compressedParams);
-    const params = JSON.parse(paramsStr);
+    // Decompress + parse the params. Malformed input is a caller error:
+    // answer with -32602/400 instead of letting the SyntaxError fall into
+    // the catch-all below and pollute server-side error metrics.
+    let params: unknown;
+    try {
+      const paramsStr = decompressParams(compressedParams);
+      params = JSON.parse(paramsStr);
+    } catch (error) {
+      console.error("Invalid compressed parameters:", error);
+      return c.json(
+        { error: { code: -32602, message: "Invalid compressed parameters" } },
+        400
+      );
+    }
     const traceId = resolveTraceId(c.req.header("X-Trace-Id"));
 
-    // The client's default path sends action names (e.g. `getBalance`) with
-    // a compressed args object. Route those through the exact same pipeline
-    // as POST /api/v1/:chainId/:actionName so args are converted to RPC
-    // params by the action handlers. Anything else (e.g. `eth_getBalance`
-    // with a params array) is passed through to the upstream node as a raw
-    // RPC call, preserving the direct-RPC contract.
-    if (
-      method in actionHandlers &&
-      typeof params === "object" &&
-      params !== null &&
-      !Array.isArray(params)
-    ) {
-      const actionName = method as ActionName;
-      const result = await executeActionWithDeduplication(
-        c,
-        chainIdNum,
-        actionName,
-        params as Record<string, unknown>
-      );
-
-      const rpcMethod = ACTION_TO_RPC_METHOD[actionName] ?? actionName;
-      const cacheStrategy = getCacheStrategy(
-        chainIdNum,
-        rpcMethod,
-        params,
-        300,
-        result.blockNumber ? parseInt(result.blockNumber, 16) : undefined
-      );
-
-      const response = c.json({
-        result: result.result,
-        blockNumber: result.blockNumber,
-        timestamp: Date.now(),
-      });
-
-      return setCacheHeaders(response, cacheStrategy.ttl, {
-        cacheStatus: result.cacheStatus,
-        traceId,
-      });
-    }
-
-    // Build request info
-    const requestInfo: RequestInfo = {
-      chainId: chainIdNum,
-      method,
-      params,
-      strategy: "compressed",
-    };
-
-    // Execute RPC call with deduplication
-    const result = await executeWithDeduplication(c, requestInfo);
-
-    // Set cache strategy
-    const cacheStrategy = getCacheStrategy(
-      requestInfo.chainId,
-      method,
-      params,
-      300,
-      result.blockNumber ? parseInt(result.blockNumber, 16) : undefined
-    );
-
-    const response = c.json({
-      result: result.result,
-      blockNumber: result.blockNumber,
-      timestamp: Date.now(),
-    });
-
-    return setCacheHeaders(response, cacheStrategy.ttl, {
-      cacheStatus: result.cacheStatus,
-      traceId,
-    });
+    return await executeAndRespond(c, chainIdNum, method, params, traceId);
   } catch (error) {
     console.error("Compressed request error:", error);
     const isDebug = c.env.ENVIRONMENT !== "production";
     return c.json(
       {
         error: {
-          code: -32603,
-          message: "Internal error",
+          ...responseErrorMessage(error),
           ...(isDebug ? { data: error instanceof Error ? error.message : "Unknown error" } : {}),
         },
       },
@@ -374,8 +407,7 @@ export const handleDirectRequest = async (c: Context<{ Bindings: Env }>) => {
     return c.json(
       {
         error: {
-          code: -32603,
-          message: "Internal error",
+          ...responseErrorMessage(error),
           ...(isDebug ? { data: error instanceof Error ? error.message : "Unknown error" } : {}),
         },
       },
@@ -444,8 +476,7 @@ export const handleFunctionRequest = async (c: Context<{ Bindings: Env }>) => {
     return c.json(
       {
         error: {
-          code: -32603,
-          message: "Internal error",
+          ...responseErrorMessage(error),
           ...(isDebug ? { data: error instanceof Error ? error.message : "Unknown error" } : {}),
         },
       },

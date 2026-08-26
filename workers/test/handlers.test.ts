@@ -70,7 +70,12 @@ vi.mock("../src/utils/compression", async (importOriginal) => {
     ...actual,
     decompressParams: vi.fn((params) => params),
     generateParamHash: vi.fn(
-      async (params) => `hash-${JSON.stringify(params).length}`
+      // 64-char lowercase hex (matches the real digest shape, which the
+      // store/cached endpoints validate), deterministic per input. The
+      // numeric tail is taken mod 2^32 so the digest stays exactly 64
+      // chars for inputs of any size.
+      async (params) =>
+        `${"0".repeat(56)}${(JSON.stringify(params).length % 0x100000000).toString(16).padStart(8, "0")}`
     ),
   };
 });
@@ -82,6 +87,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   mockFetch.mockReset();
   global.fetch = mockFetch;
+  MockDurableObjectStub.storedParams.clear();
 });
 
 afterEach(() => {
@@ -90,9 +96,33 @@ afterEach(() => {
 
 // Mock Durable Object stub
 class MockDurableObjectStub {
+  // In-memory hash->params mapping backing the PARAM_STORE binding.
+  static storedParams = new Map<string, string>();
+
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     const path = url.pathname;
+
+    // Mock ParamStore hash->params mappings.
+    if (request.method === "PUT" && path === "/params") {
+      const { hash, params } = await request.json<{
+        hash: string;
+        params: string;
+      }>();
+      MockDurableObjectStub.storedParams.set(hash, params);
+      return new Response(JSON.stringify({ success: true }), {
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
+    if (request.method === "GET" && path.startsWith("/params/")) {
+      const hash = path.slice("/params/".length);
+      const params = MockDurableObjectStub.storedParams.get(hash) ?? null;
+      return new Response(
+        JSON.stringify({ found: params !== null, params }),
+        { headers: { "Content-Type": "application/json" } }
+      );
+    }
 
     // Mock request deduplication
     if (request.method === "POST" && path === "/requests") {
@@ -132,6 +162,7 @@ class MockDurableObjectNamespace {
 
 const mockEnv = {
   PROXY_STATE: new MockDurableObjectNamespace(),
+  PARAM_STORE: new MockDurableObjectNamespace(),
   ENVIRONMENT: "test",
   MAX_CACHE_TTL: "3600",
   DEFAULT_CACHE_TTL: "300",
@@ -400,7 +431,7 @@ describe("Compression Utilities", () => {
   it("should mock generateParamHash correctly", async () => {
     const { generateParamHash } = await import("../src/utils/compression");
     const result = await generateParamHash("test");
-    expect(result).toContain("hash-");
+    expect(result).toMatch(/^[0-9a-f]{64}$/);
   });
 });
 
@@ -1438,6 +1469,7 @@ describe("Health endpoint (app-level)", () => {
     expect(body.durableObjects).toEqual({
       proxyState: true,
       statistics: false, // mockEnv has no STATISTICS binding
+      paramStore: true, // mockEnv binds PARAM_STORE
     });
     expect(body.rateLimit).toEqual({ enabled: true, limitPerMinute: 60 });
     expect(body.chains).toEqual([
@@ -2768,5 +2800,209 @@ describe("ProxyState Durable Object purge paths", () => {
       new Request("http://do/purge", { method: "POST" })
     );
     expect(await again.json()).toEqual({ deleted: 0 });
+  });
+});
+
+describe("Hash-reference flow (POST /api/v1/store + GET /api/v1/cached)", () => {
+  const paramsJson = JSON.stringify([
+    "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045",
+    "latest",
+  ]);
+  // Same mock the handlers see, so store's server-side recomputation and
+  // the cached lookup agree on the digest.
+  const storedHash = () => generateParamHash(paramsJson);
+
+  const rpcOk = (result: unknown) =>
+    new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result }), {
+      headers: { "Content-Type": "application/json" },
+    });
+
+  it("stores a valid hash/params pair", async () => {
+    const response = await app.request(
+      "/api/v1/store",
+      {
+        method: "POST",
+        body: JSON.stringify({ hash: await storedHash(), params: paramsJson }),
+      },
+      mockEnv as any
+    );
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ stored: true });
+    expect(MockDurableObjectStub.storedParams.get(await storedHash())).toBe(
+      paramsJson
+    );
+  });
+
+  it("rejects a hash that does not match params with -32602/400", async () => {
+    const wrongHash = "b".repeat(64);
+    const response = await app.request(
+      "/api/v1/store",
+      {
+        method: "POST",
+        body: JSON.stringify({ hash: wrongHash, params: paramsJson }),
+      },
+      mockEnv as any
+    );
+
+    expect(response.status).toBe(400);
+    expect((await response.json()).error.code).toBe(-32602);
+    expect(MockDurableObjectStub.storedParams.has(wrongHash)).toBe(false);
+  });
+
+  it("rejects non-hex hashes with -32602/400", async () => {
+    const response = await app.request(
+      "/api/v1/store",
+      {
+        method: "POST",
+        body: JSON.stringify({ hash: "not-a-digest", params: paramsJson }),
+      },
+      mockEnv as any
+    );
+
+    expect(response.status).toBe(400);
+    expect((await response.json()).error.code).toBe(-32602);
+  });
+
+  it("rejects oversized payloads with 413", async () => {
+    const oversized = JSON.stringify({ blob: "x".repeat(32 * 1024) });
+    const response = await app.request(
+      "/api/v1/store",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          hash: await generateParamHash(oversized),
+          params: oversized,
+        }),
+      },
+      mockEnv as any
+    );
+
+    expect(response.status).toBe(413);
+  });
+
+  it("returns 404 -32004 for a hash that was never stored", async () => {
+    const unknownHash = "c".repeat(64);
+    const response = await app.request(
+      `/api/v1/cached/1:eth_getBalance:${unknownHash}`,
+      {},
+      mockEnv as any
+    );
+
+    expect(response.status).toBe(404);
+    expect((await response.json()).error.code).toBe(-32004);
+  });
+
+  it("executes stored raw-RPC params through the shared pipeline", async () => {
+    await app.request(
+      "/api/v1/store",
+      {
+        method: "POST",
+        body: JSON.stringify({ hash: await storedHash(), params: paramsJson }),
+      },
+      mockEnv as any
+    );
+    mockFetch.mockResolvedValueOnce(rpcOk("0x1234"));
+
+    const response = await app.request(
+      `/api/v1/cached/1:eth_getBalance:${await storedHash()}`,
+      {},
+      mockEnv as any
+    );
+
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body.result).toBe("0x1234");
+    // eth_getBalance tier: account-state TTL, first execution is a MISS.
+    expect(response.headers.get("cache-control")).toContain("max-age=30");
+    expect(response.headers.get("x-cache")).toBe("MISS");
+
+    // The upstream received the stored params verbatim.
+    const rpcBody = JSON.parse(mockFetch.mock.calls[0][1].body);
+    expect(rpcBody.method).toBe("eth_getBalance");
+    expect(rpcBody.params).toEqual(JSON.parse(paramsJson));
+  });
+
+  it("routes known action names through the action pipeline", async () => {
+    const argsJson = JSON.stringify({ address: "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045" });
+    const argsHash = await generateParamHash(argsJson);
+    await app.request(
+      "/api/v1/store",
+      {
+        method: "POST",
+        body: JSON.stringify({ hash: argsHash, params: argsJson }),
+      },
+      mockEnv as any
+    );
+    mockFetch.mockResolvedValueOnce(rpcOk("0x9"));
+
+    const response = await app.request(
+      `/api/v1/cached/1:getBalance:${argsHash}`,
+      {},
+      mockEnv as any
+    );
+
+    expect(response.status).toBe(200);
+    expect((await response.json()).result).toBe("0x9");
+    const rpcBody = JSON.parse(mockFetch.mock.calls[0][1].body);
+    expect(rpcBody.method).toBe("eth_getBalance");
+  });
+
+  it("rejects malformed cache keys with -32602/400", async () => {
+    const response = await app.request(
+      "/api/v1/cached/not-a-key",
+      {},
+      mockEnv as any
+    );
+
+    expect(response.status).toBe(400);
+    expect((await response.json()).error.code).toBe(-32602);
+  });
+
+  it("rejects unsupported chains before touching ParamStore", async () => {
+    const response = await app.request(
+      `/api/v1/cached/8453:eth_getBalance:${await storedHash()}`,
+      {},
+      mockEnv as any
+    );
+
+    expect(response.status).toBe(400);
+    expect((await response.json()).error.message).toContain("8453");
+    expect(MockDurableObjectStub.storedParams.has(await storedHash())).toBe(
+      false
+    );
+  });
+});
+
+describe("Malformed percent-encoding guard", () => {
+  it("answers 400 -32602 instead of a framework-level 500 for bad escapes", async () => {
+    // Hono's query decoding throws URIError on "%%%"; the entry middleware
+    // must convert that into a caller error before any handler runs.
+    const response = await app.request(
+      "/api/v1/1/eth_getBalance?p=%%%",
+      {},
+      mockEnv as any
+    );
+
+    expect(response.status).toBe(400);
+    const body = await response.json();
+    expect(body.error.code).toBe(-32602);
+    expect(body.error.message).toContain("percent-encoding");
+  });
+
+  it("leaves well-formed query strings untouched", async () => {
+    mockFetch.mockResolvedValueOnce(
+      new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: "0x1" }), {
+        headers: { "Content-Type": "application/json" },
+      })
+    );
+
+    const response = await app.request(
+      `/api/v1/1/eth_blockNumber?p=${encodeURIComponent(JSON.stringify([]))}`,
+      {},
+      mockEnv as any
+    );
+
+    expect(response.status).toBe(200);
   });
 });

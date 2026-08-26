@@ -31,8 +31,10 @@ describe("Action Utils", () => {
       expect(url).toContain("?p=");
     });
 
-    it("should use POST for very long params", async () => {
+    it("should use the hash-reference flow for very long params", async () => {
       const mockFetch = vi.fn().mockResolvedValueOnce({
+        status: 200,
+        ok: true,
         json: () => Promise.resolve({ result: "0x1", timestamp: Date.now() }),
       });
       global.fetch = mockFetch;
@@ -41,10 +43,79 @@ describe("Action Utils", () => {
       await makeProxyRequest("readContract", 1, largeArgs, { endpoint: "https://proxy.example.com" });
 
       const [url, opts] = mockFetch.mock.calls[0];
-      expect(opts.method).toBe("POST");
-      expect(url).not.toContain("?p=");
+      expect(opts.method).toBe("GET");
+      // Fixed-length path: /api/v1/cached/{chainId}:{method}:{sha256-hex}
+      expect(String(url)).toMatch(
+        /\/api\/v1\/cached\/1:readContract:[0-9a-f]{64}$/
+      );
       expect(opts.headers["Content-Type"]).toBe("application/json");
-      expect(opts.body).toBeDefined();
+    });
+
+    it("should store-then-retry via /api/v1/store when the hash is unknown (-32004)", async () => {
+      const calls: Array<[string, RequestInit]> = [];
+      const paramsJson = JSON.stringify({ data: "x".repeat(3000) });
+      global.fetch = vi.fn(async (url: any, init?: any) => {
+        calls.push([String(url), init]);
+        // First probe of the cached URL: server has never seen the hash.
+        if (calls.length === 1) {
+          return {
+            status: 404,
+            ok: false,
+            json: () =>
+              Promise.resolve({
+                error: { code: -32004, message: "Stored params not found" },
+              }),
+          };
+        }
+        if (String(url).includes("/api/v1/store")) {
+          return {
+            status: 200,
+            ok: true,
+            json: () => Promise.resolve({ stored: true }),
+          };
+        }
+        return {
+          status: 200,
+          ok: true,
+          json: () => Promise.resolve({ result: "0x2" }),
+        };
+      }) as any;
+
+      const result = await makeProxyRequest("call", 1, { data: "x".repeat(3000) }, {
+        endpoint: "https://proxy.example.com",
+      });
+
+      expect(result).toBe("0x2");
+      expect(calls.length).toBe(3);
+      expect(calls[0][0]).toContain("/api/v1/cached/1:call:");
+      expect(calls[1][0]).toContain("/api/v1/store");
+      // The stored payload is exactly the raw params JSON whose digest is
+      // the cache key.
+      expect(JSON.parse(String(calls[1][1]!.body)).hash).toMatch(/^[0-9a-f]{64}$/);
+      expect(JSON.parse(String(calls[1][1]!.body)).params).toBe(paramsJson);
+      // The retry reuses the identical fixed-length URL.
+      expect(calls[2][0]).toBe(calls[0][0]);
+    });
+
+    it("should keep the legacy compressed-GET/POST decision below compressionThreshold", async () => {
+      const mockFetch = vi.fn().mockResolvedValueOnce({
+        status: 200,
+        ok: true,
+        json: () => Promise.resolve({ result: "0x1" }),
+      });
+      global.fetch = mockFetch;
+
+      const largeArgs: Record<string, unknown> = { data: "x".repeat(3000) };
+      await makeProxyRequest("readContract", 1, largeArgs, {
+        endpoint: "https://proxy.example.com",
+        compressionThreshold: 10000,
+      });
+
+      // Below the threshold the payload re-enters the legacy decision:
+      // its compressed URL still exceeds the 2048-char GET limit -> POST.
+      const [url, opts] = mockFetch.mock.calls[0];
+      expect(opts.method).toBe("POST");
+      expect(String(url)).not.toContain("/api/v1/cached/");
     });
 
     it("should include X-API-Key header in GET when apiKey is set", async () => {
@@ -420,9 +491,11 @@ describe("Action Utils", () => {
       expect(snapshot.methodStats.getBalance.count).toBe(2);
     });
 
-    it("should record failed requests with error metrics and POST strategy", async () => {
+    it("should record failed requests with error metrics and cached strategy", async () => {
       resetMetrics();
       const mockFetch = vi.fn().mockResolvedValue({
+        status: 200,
+        ok: true,
         json: () => Promise.resolve({ error: { code: -32000, message: "execution reverted" } }),
       });
       global.fetch = mockFetch;
@@ -438,7 +511,7 @@ describe("Action Utils", () => {
       expect(snapshot.errorCount).toBe(1);
       expect(snapshot.errorRate).toBe(1);
       expect(snapshot.methodStats.readContract.errorCount).toBe(1);
-      expect(snapshot.strategyCounts.direct).toBe(1);
+      expect(snapshot.strategyCounts.cached).toBe(1);
       expect(snapshot.chainIds).toEqual([137]);
     });
 
@@ -611,7 +684,7 @@ describe("Action Utils", () => {
         responseTimeP95: 0,
         responseTimeP99: 0,
         chainIds: [],
-        strategyCounts: { compressed: 0, direct: 0 },
+        strategyCounts: { compressed: 0, direct: 0, cached: 0 },
         methodStats: {},
       });
     });
@@ -632,7 +705,7 @@ describe("Action Utils", () => {
       expect(snapshot.averageResponseTime).toBe(20);
       expect(snapshot.responseTimeP50).toBe(20);
       expect(snapshot.chainIds).toEqual([1, 137]);
-      expect(snapshot.strategyCounts).toEqual({ compressed: 2, direct: 1 });
+      expect(snapshot.strategyCounts).toEqual({ compressed: 2, direct: 1, cached: 0 });
 
       expect(snapshot.methodStats.getBalance).toEqual({
         count: 2,
@@ -752,7 +825,7 @@ describe("Action Utils", () => {
       const snapshot = collector.getSnapshot();
       expect(snapshot.totalRequests).toBe(0);
       expect(snapshot.methodStats).toEqual({});
-      expect(snapshot.strategyCounts).toEqual({ compressed: 0, direct: 0 });
+      expect(snapshot.strategyCounts).toEqual({ compressed: 0, direct: 0, cached: 0 });
     });
 
     it("should drop fallback counters on reset", () => {

@@ -328,8 +328,20 @@ type ProxyConfig = {
     attempts: number           // 总尝试次数（含首次请求），默认 3
     delay: number              // 重试基础延迟(ms)，指数退避，默认 500
   }
-  compressionThreshold?: number // 参数压缩阈值
+  compressionThreshold?: number // 大参数哈希引用阈值(字符数)，默认 1500，需与服务端 COMPRESSION_THRESHOLD 一致
 }
+```
+
+##### 大参数哈希引用流程
+
+序列化后长度 ≥ `compressionThreshold` 的参数不再压缩进查询串，而是走固定长度的可缓存 GET 路径：
+
+```
+GET /api/v1/cached/{chainId}:{actionName}:{sha256(params)}
+  → 404 -32004 (服务端未见此哈希)
+POST /api/v1/store {"hash": "<sha256-hex>", "params": "<原始JSON字符串>"}
+  → 服务端重算摘要校验绑定，幂等写入（30 天 TTL）
+GET /api/v1/cached/... → 执行并缓存，后续相同哈希直接命中
 ```
 
 #### ProxyActionConfig（用于单独 actions）

@@ -4,6 +4,7 @@ import { actionHandlers, type ActionName, type ActionContext } from "../actions"
 import { parseChainIdParam } from "../actions/utils";
 import { getCacheStrategy, resolveTraceId, setCacheHeaders } from "../utils/cache";
 import { recordRequestStats } from "../utils/statistics";
+import { responseErrorMessage } from "../utils/errors";
 import { generateParamHash } from "../utils/compression";
 
 export const ACTION_TO_RPC_METHOD: Record<string, string> = {
@@ -256,8 +257,7 @@ export const handleActionRequest = async (c: Context<{ Bindings: Env }>) => {
     return c.json(
       {
         error: {
-          code: -32603,
-          message: "Internal error",
+          ...responseErrorMessage(error),
           ...(isDebug ? { data: error instanceof Error ? error.message : "Unknown error" } : {}),
         },
       },
